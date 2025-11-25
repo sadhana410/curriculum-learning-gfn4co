@@ -37,14 +37,14 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
             logprobs_b += torch.log(probs[traj_actions[i]] + 1e-8)
 
         # log reward and TB loss
-        logreward = torch.log(torch.tensor([reward], dtype=torch.float32) + 1e-8)
+        logreward = torch.log(torch.tensor([reward], dtype=torch.float32, device=device) + 1e-8)
         loss = loss_fn(logprobs_f, logprobs_b, logreward)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        if step % 200 == 0:
+        if step % 5 == 0:
             print(f"[{step}] loss={loss.item():.4f}, reward={reward:.4f}")
 
     return last_terminal_state

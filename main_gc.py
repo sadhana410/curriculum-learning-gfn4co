@@ -16,7 +16,11 @@ DATA_DIR = "data"   # folder containing .col files
 
 
 def main():
-    device = "cpu"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print()
 
     col_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".col")]
     col_files.sort()  
@@ -31,6 +35,10 @@ def main():
     print(f"\nLoading graph from {path}...\n")
 
     adj = load_col_file(path)
+
+    if not isinstance(adj, torch.Tensor):
+        adj = torch.from_numpy(adj) if isinstance(adj, np.ndarray) else torch.tensor(adj)
+    adj = adj.to(device)
     instance = {"adj": adj}
 
     N = adj.shape[0]
@@ -38,10 +46,10 @@ def main():
 
     print(f"Graph loaded: {filename} with {N} nodes")
 
-    forward = GNNPolicy(num_nodes=N, num_colors=K)
-    backward = GNNPolicy(num_nodes=N, num_colors=K)
+    forward = GNNPolicy(num_nodes=N, num_colors=K).to(device)
+    backward = GNNPolicy(num_nodes=N, num_colors=K).to(device)
 
-    loss_fn = TrajectoryBalance(forward, backward)
+    loss_fn = TrajectoryBalance(forward, backward).to(device)
 
     optimizer = torch.optim.Adam(
         list(forward.parameters()) +
