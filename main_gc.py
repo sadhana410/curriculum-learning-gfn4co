@@ -21,6 +21,7 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
+    # device = "cpu"
 
     col_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".col")]
     col_files.sort()  
