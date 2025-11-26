@@ -17,6 +17,10 @@ class GNNPolicy(nn.Module):
         super().__init__()
         self.N = num_nodes
         self.K = num_colors
+        self.hidden_dim = hidden_dim
+        
+        # Cache for adjacency matrix
+        self._adj_cache = None
 
         self.embedding = nn.Embedding(num_colors + 1, hidden_dim)
 
@@ -25,6 +29,15 @@ class GNNPolicy(nn.Module):
 
         self.out = nn.Linear(hidden_dim, num_colors)
 
+    def _get_adj(self, adj, device):
+        """Cache adjacency matrix on device."""
+        if self._adj_cache is None or self._adj_cache.device != torch.device(device):
+            if isinstance(adj, np.ndarray):
+                self._adj_cache = torch.tensor(adj, dtype=torch.float32, device=device)
+            else:
+                self._adj_cache = adj.to(device).float()
+        return self._adj_cache
+
     def forward(self, state, adj, device="cpu"):
         """
         state: numpy array or 1D tensor of length N, values in {-1,0,...,K-1}
@@ -32,23 +45,20 @@ class GNNPolicy(nn.Module):
         returns: logits of shape (N*K,)
         """
         if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.long, device=device)
+            state = torch.as_tensor(state, dtype=torch.long, device=device)
         else:
             state = state.to(device).long()
 
-        color_ids = state.clone()
-        color_ids[color_ids == -1] = self.K
+        # Replace -1 with K for embedding lookup
+        color_ids = torch.where(state == -1, self.K, state)
 
         x = self.embedding(color_ids) 
 
-        if isinstance(adj, np.ndarray):
-            A = torch.tensor(adj, dtype=torch.float32, device=device)
-        else:
-            A = adj.to(device).float()
+        A = self._get_adj(adj, device)
 
         #h = ReLU( W_self x + W_neigh (A x) )
         h_self = self.W_self(x)
-        neigh_agg = torch.matmul(A, x)         
+        neigh_agg = A @ x
         h_neigh = self.W_neigh(neigh_agg)
 
         h = torch.relu(h_self + h_neigh)        
