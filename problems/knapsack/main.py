@@ -56,86 +56,159 @@ def sample_trajectory(env, forward_policy, device, epsilon=0.1):
     return traj_states, traj_actions, reward
 
 
-def train(env, forward_policy, backward_policy, loss_fn, optimizer,
-          steps=2000, device="cpu", save_dir=None, problem_name=None):
-    """Training loop for knapsack GFN."""
-    if save_dir is None:
-        save_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+def compute_logprobs(traj_states, traj_actions, forward_policy, backward_policy, env, device):
+    """Compute forward and backward log probabilities for a trajectory."""
     import torch.nn.functional as F
     
+    logprob_f = torch.tensor(0.0, device=device)
+    logprob_b = torch.tensor(0.0, device=device)
+    inf_tensor = torch.tensor(float('-inf'), device=device)
+    
+    for i, action in enumerate(traj_actions):
+        state_before = traj_states[i]
+        state_after = traj_states[i + 1]
+        
+        # Forward
+        logits_f = forward_policy(state_before, device=device)
+        mask_f = torch.tensor(env.allowed_actions(state_before), dtype=torch.float32, device=device)
+        logits_f = torch.where(mask_f > 0, logits_f, inf_tensor)
+        logprob_f = logprob_f + F.log_softmax(logits_f, dim=0)[action]
+        
+        # Backward
+        logits_b = backward_policy(state_after, device=device)
+        backward_mask = torch.zeros(2 * env.N, device=device)
+        decided = state_after != -1
+        for j in np.where(decided)[0]:
+            if state_after[j] == 1:
+                backward_mask[j] = 1.0  # undo select
+            else:
+                backward_mask[env.N + j] = 1.0  # undo skip
+        logits_b = torch.where(backward_mask > 0, logits_b, inf_tensor)
+        logprob_b = logprob_b + F.log_softmax(logits_b, dim=0)[action]
+    
+    return logprob_f, logprob_b
+
+
+def train(env, forward_policy, backward_policy, loss_fn, optimizer,
+          steps=2000, device="cpu", save_dir=None, problem_name=None,
+          batch_size=16, epsilon_start=0.5, log_dir=None):
+    """Training loop for knapsack GFN with batch training."""
+    import json
+    import time
+    from datetime import datetime
+    
+    if save_dir is None:
+        save_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+    if log_dir is None:
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    
     os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Setup logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_name = f"{problem_name}_{timestamp}" if problem_name else f"train_{timestamp}"
+    log_path = os.path.join(log_dir, f"{log_name}.jsonl")
+    
+    config = {
+        "type": "config",
+        "problem_name": problem_name,
+        "steps": steps,
+        "batch_size": batch_size,
+        "epsilon_start": epsilon_start,
+        "num_items": env.N,
+        "capacity": env.capacity,
+        "device": str(device),
+        "timestamp": timestamp,
+    }
+    with open(log_path, "w") as f:
+        f.write(json.dumps(config) + "\n")
+    
+    print(f"Logging to: {log_path}")
+    start_time = time.time()
     
     reward_history = []
     profit_history = []
+    loss_history = []
     best_profit = 0.0
     best_state = None
     
-    accum_steps = 4
-    optimizer.zero_grad()
-    
     for step in range(steps):
-        epsilon = max(0.05, 0.5 * (1 - step / steps))
+        epsilon = max(0.01, epsilon_start * (1 - step / steps))
         
-        traj_states, traj_actions, reward = sample_trajectory(
-            env, forward_policy, device, epsilon=epsilon
-        )
+        # Sample batch of trajectories
+        batch_losses = []
+        batch_rewards = []
+        batch_profits = []
         
-        final_state = traj_states[-1]
-        profit = env.get_profit(final_state)
-        weight = env.get_weight(final_state)
-        
-        reward_history.append(reward)
-        profit_history.append(profit)
-        
-        if profit > best_profit and weight <= env.capacity:
-            best_profit = profit
-            best_state = final_state.copy()
-        
-        # Compute log probabilities
-        logprob_f = torch.tensor(0.0, device=device)
-        logprob_b = torch.tensor(0.0, device=device)
-        
-        for i, action in enumerate(traj_actions):
-            state_before = traj_states[i]
-            state_after = traj_states[i + 1]
+        for _ in range(batch_size):
+            traj_states, traj_actions, reward = sample_trajectory(
+                env, forward_policy, device, epsilon=epsilon
+            )
             
-            # Forward
-            logits_f = forward_policy(state_before, device=device)
-            mask_f = torch.tensor(env.allowed_actions(state_before), dtype=torch.float32, device=device)
-            logits_f = torch.where(mask_f > 0, logits_f, torch.tensor(float('-inf'), device=device))
-            logprob_f = logprob_f + F.log_softmax(logits_f, dim=0)[action]
+            final_state = traj_states[-1]
+            profit = env.get_profit(final_state)
+            weight = env.get_weight(final_state)
             
-            # Backward
-            logits_b = backward_policy(state_after, device=device)
-            # Backward mask: can undo any decided item
-            backward_mask = torch.zeros(2 * env.N, device=device)
-            decided = state_after != -1
-            for j in np.where(decided)[0]:
-                if state_after[j] == 1:
-                    backward_mask[j] = 1.0  # undo select
-                else:
-                    backward_mask[env.N + j] = 1.0  # undo skip
-            logits_b = torch.where(backward_mask > 0, logits_b, torch.tensor(float('-inf'), device=device))
-            logprob_b = logprob_b + F.log_softmax(logits_b, dim=0)[action]
+            batch_rewards.append(reward)
+            batch_profits.append(profit)
+            
+            if profit > best_profit and weight <= env.capacity:
+                best_profit = profit
+                best_state = final_state.copy()
+            
+            # Compute log probabilities
+            logprob_f, logprob_b = compute_logprobs(
+                traj_states, traj_actions, forward_policy, backward_policy, env, device
+            )
+            
+            # TB loss
+            logreward = torch.log(torch.tensor(reward + 1e-8, device=device))
+            traj_loss = loss_fn(logprob_f, logprob_b, logreward)
+            batch_losses.append(traj_loss)
         
-        # TB loss
-        logreward = torch.log(torch.tensor(reward + 1e-8, device=device))
-        loss = loss_fn(logprob_f, logprob_b, logreward) / accum_steps
+        # Cumulative loss: mean over batch
+        cumulative_loss = torch.stack(batch_losses).mean()
+        reward_history.extend(batch_rewards)
+        profit_history.extend(batch_profits)
+        loss_history.append(cumulative_loss.item())
         
-        loss.backward()
+        optimizer.zero_grad()
+        cumulative_loss.backward()
         
-        if (step + 1) % accum_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(forward_policy.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_(backward_policy.parameters(), max_norm=0.5)
+        torch.nn.utils.clip_grad_norm_([loss_fn.logZ], max_norm=0.5)
+        optimizer.step()
         
         if step % 50 == 0:
-            avg_reward = np.mean(reward_history[-50:]) if len(reward_history) >= 50 else np.mean(reward_history)
-            avg_profit = np.mean(profit_history[-50:]) if len(profit_history) >= 50 else np.mean(profit_history)
-            items_selected = np.sum(final_state == 1)
-            print(f"[{step}] loss={loss.item()*accum_steps:.4f}, reward={reward:.4f}, "
-                  f"profit={profit:.0f}, avg_profit={avg_profit:.1f}, best={best_profit:.0f}, "
-                  f"weight={weight:.0f}/{env.capacity}, items={items_selected}/{env.N}, eps={epsilon:.2f}", 
-                  flush=True)
+            avg_reward = np.mean(reward_history[-50*batch_size:]) if len(reward_history) >= 50*batch_size else np.mean(reward_history)
+            avg_profit = np.mean(profit_history[-50*batch_size:]) if len(profit_history) >= 50*batch_size else np.mean(profit_history)
+            avg_loss = np.mean(loss_history[-50:]) if len(loss_history) >= 50 else np.mean(loss_history)
+            batch_avg_profit = np.mean(batch_profits)
+            elapsed = time.time() - start_time
+            
+            print(f"[{step}] loss={cumulative_loss.item():.4f} (avg={avg_loss:.4f}), "
+                  f"batch_profit={batch_avg_profit:.1f}, avg_profit={avg_profit:.1f}, best={best_profit:.0f}, "
+                  f"eps={epsilon:.3f}", flush=True)
+            
+            # Log to file
+            log_entry = {
+                "type": "step",
+                "step": step,
+                "loss": float(cumulative_loss.item()),
+                "avg_loss": float(avg_loss),
+                "batch_profit": float(batch_avg_profit),
+                "avg_profit": float(avg_profit),
+                "best_profit": float(best_profit),
+                "avg_reward": float(avg_reward),
+                "epsilon": float(epsilon),
+                "logZ": float(loss_fn.logZ.item()),
+                "elapsed_seconds": float(elapsed),
+            }
+            with open(log_path, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
         
         if (step + 1) % 500 == 0:
             checkpoint = {
@@ -148,7 +221,6 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
                 'best_state': best_state,
                 'problem_name': problem_name,
             }
-            # Save with problem name prefix if provided
             if problem_name:
                 ckpt_name = f'{problem_name}_step_{step+1}.pt'
             else:
@@ -167,6 +239,10 @@ def main():
                         help="List all available problems and exit")
     parser.add_argument("--steps", type=int, default=5000,
                         help="Number of training steps")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Number of trajectories per training step")
+    parser.add_argument("--epsilon", type=float, default=0.5,
+                        help="Initial epsilon for exploration (decays to 0.01)")
     parser.add_argument("--hidden-dim", type=int, default=128,
                         help="Hidden dimension for policy networks")
     args = parser.parse_args()
@@ -245,7 +321,9 @@ def main():
         optimizer=optimizer,
         steps=args.steps,
         device=device,
-        problem_name=args.problem
+        problem_name=args.problem,
+        batch_size=args.batch_size,
+        epsilon_start=args.epsilon
     )
     
     print(f"\n{'='*50}")

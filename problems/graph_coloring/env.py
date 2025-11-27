@@ -72,24 +72,23 @@ class GraphColoringEnv(BaseEnv):
         # Count colored nodes and colors used
         colored = np.sum(colored_mask)
         colors_used = len(set(c for c in state if c != -1)) if colored > 0 else 0
-        
+        # if colored == self.N and conflicts == 0:
+        #     return float(np.exp(-colors_used))
+        # else:
+        #     return float(0.0)
         if colored == self.N and conflicts == 0:
-            # Valid complete coloring - STRONG exponential reward for fewer colors
-            # Using chromatic number (4) vs all colors (5) should be a big difference
-            colors_saved = self.K - colors_used
-            # exp(2 * colors_saved) makes 4 colors give exp(2)=7.4x more than 5 colors
-            return float(np.exp(2.0 * colors_saved))
+            # Valid complete coloring - reward fewer colors
+            # Scale: exp(N/colors_used) so logreward ≈ N/colors_used (same scale as logprobs)
+            # For N=23, colors=5: reward = exp(4.6) ≈ 100, logreward ≈ 4.6
+            # For N=23, colors=23: reward = exp(1) ≈ 2.7, logreward ≈ 1
+            return float(np.exp(self.N / colors_used))
         elif colored == self.N and conflicts > 0:
-            # Complete but invalid - very small reward
-            return float(0.01 * np.exp(-conflicts))
+            # Complete but invalid - penalize conflicts
+            return float(np.exp(-conflicts))
         else:
-            # Partial coloring - reward based on progress AND color efficiency
-            # Bonus for using fewer colors so far (encourages color reuse during exploration)
+            # Partial coloring - small reward
             progress = colored / self.N
-            # Expected colors at this point if optimal: roughly (colored/N) * chromatic_number
-            expected_colors = max(1, (colored / self.N) * self.chromatic_number)
-            color_efficiency = expected_colors / max(1, colors_used)  # >1 if using fewer than expected
-            return float(0.01 * progress * color_efficiency * np.exp(-conflicts))
+            return float(np.exp(-10 + progress * 5))  # logreward in [-10, -5] range
 
     def encode_state(self, state):
         one_hot = np.zeros((self.N, self.K), dtype=np.float32)
