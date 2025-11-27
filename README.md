@@ -55,14 +55,21 @@ python problems/graph_coloring/main.py --chromatic 3 --steps 5000
 # Train on myciel3 (chromatic number = 4)
 python problems/graph_coloring/main.py --chromatic 4 --steps 10000
 
-# Train on myciel4 (chromatic number = 5) with 2 extra colors
-python problems/graph_coloring/main.py --chromatic 5 --extra-colors 2 --steps 10000
+# Train on myciel4 (chromatic number = 5) with max 7 colors
+python problems/graph_coloring/main.py --chromatic 5 --max-colors 7 --steps 10000
+
+# Train with custom batch size and exploration
+python problems/graph_coloring/main.py --chromatic 4 --batch-size 32 --epsilon 0.3 --steps 5000
 ```
 
 **Arguments:**
 - `--chromatic`: Target chromatic number (selects corresponding myciel graph)
-- `--extra-colors`: Extra colors beyond chromatic number (default: 1)
+- `--max-colors`: Maximum number of colors available (default: chromatic number)
 - `--steps`: Number of training steps (default: 10000)
+- `--batch-size`: Number of trajectories per training step (default: 16)
+- `--epsilon`: Initial epsilon for exploration, decays to 0.01 (default: 0.5)
+
+Training logs are saved to `problems/graph_coloring/logs/` in JSON Lines format.
 
 #### Evaluation
 
@@ -96,13 +103,20 @@ python problems/knapsack/main.py --list
 # Train on a specific problem
 python problems/knapsack/main.py --problem p01 --steps 5000
 python problems/knapsack/main.py --problem p02 --steps 5000
+
+# Train with custom batch size and exploration
+python problems/knapsack/main.py --problem p01 --batch-size 32 --epsilon 0.3 --steps 3000
 ```
 
 **Arguments:**
 - `--problem`: Problem name (e.g., p01, p02). Required.
 - `--list`: List all available problems and exit
 - `--steps`: Number of training steps (default: 5000)
+- `--batch-size`: Number of trajectories per training step (default: 16)
+- `--epsilon`: Initial epsilon for exploration, decays to 0.01 (default: 0.5)
 - `--hidden-dim`: Hidden dimension for policy networks (default: 128)
+
+Training logs are saved to `problems/knapsack/logs/` in JSON Lines format.
 
 #### Evaluation
 

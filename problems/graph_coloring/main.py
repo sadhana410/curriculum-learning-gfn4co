@@ -38,10 +38,14 @@ def main():
     parser = argparse.ArgumentParser(description="Train GFlowNet for Graph Coloring")
     parser.add_argument("--chromatic", type=int, default=4, 
                         help="Chromatic number to train on (selects corresponding myciel graph)")
-    parser.add_argument("--extra-colors", type=int, default=1,
-                        help="Extra colors beyond chromatic number (default: 1)")
+    parser.add_argument("--max-colors", type=int, default=None,
+                        help="Maximum number of colors the model can use (default: chromatic number)")
     parser.add_argument("--steps", type=int, default=10000,
                         help="Number of training steps")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Number of trajectories per training step")
+    parser.add_argument("--epsilon", type=float, default=0.5,
+                        help="Initial epsilon for exploration (decays to 0.01)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,7 +76,8 @@ def main():
         print(f" - {f} (chromatic={chrom}){marker}")
 
     chromatic_number = args.chromatic
-    K = chromatic_number + args.extra_colors
+    # K is the max colors available; defaults to chromatic number if not specified
+    K = args.max_colors if args.max_colors is not None else chromatic_number
 
     path = os.path.join(DATA_DIR, filename)
     print(f"\nLoading graph from {path}...\n")
@@ -97,12 +102,13 @@ def main():
         list(forward.parameters()) +
         list(backward.parameters()) +
         list(loss_fn.parameters()),
-        lr=1e-3
+        lr=1e-4  # Lower LR for stability with batch training
     )
 
     env = GraphColoringEnv(instance, num_colors=K, chromatic_number=chromatic_number)
 
     save_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
     
     # Problem name for checkpoint (e.g., myciel3_K4)
     problem_name = filename.replace('.col', '') + f'_K{K}'
@@ -117,7 +123,10 @@ def main():
         steps=args.steps,          
         device=device,
         save_dir=save_dir,
-        problem_name=problem_name
+        problem_name=problem_name,
+        batch_size=args.batch_size,
+        epsilon_start=args.epsilon,
+        log_dir=log_dir
     )
 
     print("\nFinal state:", final_state)
