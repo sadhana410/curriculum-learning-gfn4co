@@ -118,7 +118,6 @@ class GraphColoringEnv(BaseEnv):
         color_bonus = np.exp(gamma * (self.K - colors_used))
 
         return float(base * color_bonus)
->>>>>>> 4b42405 (updated graph colouring)
 
     def encode_state(self, state):
         """
