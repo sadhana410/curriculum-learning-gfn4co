@@ -1,16 +1,17 @@
-# models/policy_net.py
-
 import torch
 import torch.nn as nn
 import numpy as np
 
+
 class GNNPolicy(nn.Module):
     """
-    GNN policy for graph colouring.
+    Simple 1-layer GNN policy for Graph Coloring.
 
-    Inputs:  state (length N, values in {-1, 0, ..., K-1}),
-               adj   (NxN adjacency matrix)
-    Output:  logits over N*K actions (node* K + color)
+    Inputs:
+        state: length-N array, each entry in {-1, 0, ..., K-1}
+        adj: NxN adjacency matrix (numpy or torch)
+    Output:
+        logits of shape (N*K,)
     """
 
     def __init__(self, num_nodes: int, num_colors: int, hidden_dim: int = 64):
@@ -18,52 +19,59 @@ class GNNPolicy(nn.Module):
         self.N = num_nodes
         self.K = num_colors
         self.hidden_dim = hidden_dim
-        
-        # Cache for adjacency matrix
+
+        # Cache adjacency on device
         self._adj_cache = None
 
-        self.embedding = nn.Embedding(num_colors + 1, hidden_dim)
+        # We need K+1 embeddings because -1 is mapped to index K
+        self.embedding = nn.Embedding(self.K + 1, hidden_dim)
 
+        # Message passing: x -> Wx_self + W(Ax)
         self.W_self = nn.Linear(hidden_dim, hidden_dim)
         self.W_neigh = nn.Linear(hidden_dim, hidden_dim)
 
-        self.out = nn.Linear(hidden_dim, num_colors)
+        # Output logits for each node: shape (N, K)
+        self.out = nn.Linear(hidden_dim, self.K)
+
 
     def _get_adj(self, adj, device):
-        """Cache adjacency matrix on device."""
+        """Ensure adjacency is a torch tensor (cached per device)."""
         if self._adj_cache is None or self._adj_cache.device != torch.device(device):
             if isinstance(adj, np.ndarray):
-                self._adj_cache = torch.tensor(adj, dtype=torch.float32, device=device)
+                A = torch.tensor(adj, dtype=torch.float32, device=device)
             else:
-                self._adj_cache = adj.to(device).float()
+                A = adj.to(device).float()
+            self._adj_cache = A
         return self._adj_cache
+
 
     def forward(self, state, adj, device="cpu"):
         """
-        state: numpy array or 1D tensor of length N, values in {-1,0,...,K-1}
-        adj:   numpy array NxN (0/1)
-        returns: logits of shape (N*K,)
+        Forward pass returning logits of size (N*K).
         """
+        # Convert state to tensor on device
         if isinstance(state, np.ndarray):
             state = torch.as_tensor(state, dtype=torch.long, device=device)
         else:
             state = state.to(device).long()
 
-        # Replace -1 with K for embedding lookup
+        # Replace -1 (uncolored) with index K
         color_ids = torch.where(state == -1, self.K, state)
 
-        x = self.embedding(color_ids) 
+        # Node embeddings: (N, hidden_dim)
+        x = self.embedding(color_ids)
 
         A = self._get_adj(adj, device)
 
-        #h = ReLU( W_self x + W_neigh (A x) )
+        # GNN update
+        # h = ReLU( W_self x + W_neigh (A x) )
         h_self = self.W_self(x)
         neigh_agg = A @ x
         h_neigh = self.W_neigh(neigh_agg)
+        h = torch.relu(h_self + h_neigh)
 
-        h = torch.relu(h_self + h_neigh)        
+        # Output node logits shape (N, K)
+        node_logits = self.out(h)
 
-        node_logits = self.out(h)              
-
-        #action logits (node * K + color)
-        return node_logits.view(-1)             # (N*K,)
+        # Flatten to shape (N*K,)
+        return node_logits.reshape(-1)
