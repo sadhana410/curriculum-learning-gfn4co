@@ -63,9 +63,8 @@ python problems/graph_coloring/main.py --chromatic 4 --batch-size 32 --epsilon 0
 ```
 
 **Arguments:**
-- `--chromatic`: Target chromatic number (selects corresponding myciel graph)
-- `--max-colors`: Maximum number of colors available (default: chromatic number)
-- `--steps`: Number of training steps (default: 10000)
+- `--graph`: Name of graph instance (Required)
+- `--steps`: Number of training steps (default: 5000)
 - `--batch-size`: Number of trajectories per training step (default: 16)
 - `--epsilon`: Initial epsilon for exploration, decays to 0.01 (default: 0.5)
 
