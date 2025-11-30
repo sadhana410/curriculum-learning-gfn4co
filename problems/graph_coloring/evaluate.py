@@ -3,6 +3,8 @@
 import argparse
 import os
 import sys
+import json
+from datetime import datetime
 import numpy as np
 import torch
 
@@ -17,6 +19,7 @@ from problems.graph_coloring.utils import load_col_file
 # Data and checkpoint directories relative to this file
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 
 # Myciel graphs chromatic numbers
 CHROMATIC_NUMBERS = {
@@ -349,6 +352,46 @@ def main():
         print(f"Error: {e}")
         import traceback
         traceback.print_exc()
+        return
+    
+    # Save evaluation log
+    os.makedirs(LOG_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_name = f"eval_{args.graph.replace('.col', '')}_{timestamp}.json"
+    log_path = os.path.join(LOG_DIR, log_name)
+    
+    log_data = {
+        "type": "evaluation",
+        "timestamp": timestamp,
+        "graph": args.graph,
+        "checkpoint": os.path.basename(checkpoint_path),
+        "chromatic_number": chromatic,
+        "num_colors": results['num_colors'],
+        "nodes": results['nodes'],
+        "training_step": results['training_step'],
+        "num_samples": args.samples,
+        "greedy": {
+            "colored": int(results['greedy_colored']),
+            "colors_used": results['greedy_colors'],
+            "conflicts": results['greedy_conflicts'],
+            "is_valid": results['greedy_conflicts'] == 0 and results['greedy_colored'] == results['nodes'],
+            "is_optimal": results['greedy_conflicts'] == 0 and results['greedy_colors'] <= chromatic,
+            "state": results['greedy_state'].tolist(),
+        },
+        "stochastic": {
+            "colored": int(results['stochastic_colored']),
+            "colors_used": results['stochastic_colors'],
+            "conflicts": results['stochastic_conflicts'],
+            "is_valid": results['stochastic_conflicts'] == 0 and results['stochastic_colored'] == results['nodes'],
+            "is_optimal": results['stochastic_conflicts'] == 0 and results['stochastic_colors'] <= chromatic,
+            "state": results['stochastic_state'].tolist(),
+        },
+    }
+    
+    with open(log_path, "w") as f:
+        json.dump(log_data, f, indent=2)
+    
+    print(f"\nEvaluation log saved to: {log_path}")
 
 
 if __name__ == "__main__":

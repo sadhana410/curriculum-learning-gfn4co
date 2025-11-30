@@ -20,7 +20,7 @@ class KnapsackEnv(BaseEnv):
             action < N means select item (action), action >= N means skip item (action - N)
     """
     
-    def __init__(self, instance):
+    def __init__(self, instance, alpha=0.1, beta=0.01, gamma=1.0):
         """
         instance should contain:
             - 'profits': array of item profits/values
@@ -28,9 +28,15 @@ class KnapsackEnv(BaseEnv):
             - 'capacity': knapsack capacity
         """
         self.profits = np.array(instance['profits'], dtype=np.float32)
+        self.values = self.profits # Alias for reward function
         self.weights = np.array(instance['weights'], dtype=np.float32)
         self.capacity = instance['capacity']
         self.N = len(self.profits)
+        
+        # Hyperparameters for reward
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
         
         # Precompute for reward normalization
         self.max_profit = np.sum(self.profits)
@@ -81,6 +87,37 @@ class KnapsackEnv(BaseEnv):
         reward = self.reward(next_state) if done else 0.0
         return next_state, reward, done
     
+    def step_batch(self, states, actions):
+        """
+        Vectorized step for batch of states.
+        """
+        B, N = states.shape
+        next_states = states.copy()
+        
+        select_mask = actions < N
+        skip_mask = ~select_mask
+        
+        # Select updates
+        if select_mask.any():
+            idx = np.where(select_mask)[0]
+            next_states[idx, actions[idx]] = 1
+            
+        # Skip updates
+        if skip_mask.any():
+            idx = np.where(skip_mask)[0]
+            next_states[idx, actions[idx] - N] = 0
+            
+        # Done check (fully decided)
+        dones = (next_states != -1).all(axis=1)
+        
+        # Rewards
+        rewards = np.zeros(B, dtype=np.float32)
+        if dones.any():
+            done_states = next_states[dones]
+            rewards[dones] = self.reward_batch(done_states)
+            
+        return next_states, rewards, dones
+    
     def is_terminal(self, state):
         # Terminal if all items are decided
         if np.all(state != -1):
@@ -91,22 +128,58 @@ class KnapsackEnv(BaseEnv):
     
     def reward(self, state):
         """
-        Reward based on total profit of selected items.
-        Higher profit = higher reward.
+        state: 1D numpy array or torch tensor of {0,1}, shape (n,)
+        returns: scalar float log-reward
         """
-        selected = state == 1
-        total_profit = np.sum(self.profits[selected])
-        total_weight = np.sum(self.weights[selected])
+        # Convert to numpy if needed
+        if "torch" in str(type(state)):
+            state = state.detach().cpu().numpy()
+        state = state.astype(float)
+
+        total_weight = float(np.dot(state, self.weights))
+        total_value = float(np.dot(state, self.values))
+
+        # How far from capacity
+        slack = max(0.0, self.capacity - total_weight)          # underfilled
+        overflow = max(0.0, total_weight - self.capacity)       # overweight
+
+        # Log-reward: balance value, slack, and overflow
+        logR = (
+            self.alpha * total_value
+            - self.beta * slack
+            - self.gamma * overflow
+        )
+
+        # Scale by N to align magnitude with TB loss (sum over N steps)
+        logR = logR * self.N
+
+        return float(logR)
+    
+    def reward_batch(self, states):
+        """Vectorized reward for batch of states (B, N)."""
+        B, N = states.shape
         
-        # Check feasibility
-        if total_weight > self.capacity:
-            # Infeasible - very small reward
-            return 0.001
+        # Cast to float for dot product
+        states_float = states.astype(np.float32)
         
-        # Reward proportional to profit (normalized and exponentiated for GFN)
-        # Using exp to make reward positive and emphasize better solutions
-        profit_ratio = total_profit / (self.max_profit + 1e-8)
-        return float(np.exp(2.0 * profit_ratio))
+        total_weight = np.dot(states_float, self.weights)
+        total_value = np.dot(states_float, self.values)
+        
+        # How far from capacity
+        slack = np.maximum(0.0, self.capacity - total_weight)
+        overflow = np.maximum(0.0, total_weight - self.capacity)
+        
+        # Log-reward
+        logR = (
+            self.alpha * total_value
+            - self.beta * slack
+            - self.gamma * overflow
+        )
+        
+        # Scale by N to align magnitude with TB loss (sum over N steps)
+        logR = logR * N
+        
+        return logR
     
     def encode_state(self, state):
         """Encode state as feature vector."""

@@ -3,6 +3,8 @@
 import argparse
 import os
 import sys
+import json
+from datetime import datetime
 import numpy as np
 import torch
 
@@ -17,6 +19,7 @@ from problems.knapsack.utils import load_knapsack_instance, list_knapsack_instan
 # Data and checkpoint directories relative to this file
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 
 
 def load_checkpoint(checkpoint_path, num_items, hidden_dim, device):
@@ -271,6 +274,55 @@ def main():
             g_gap = f"{r['greedy_gap']:.1f}" if 'greedy_gap' in r else "?"
             s_gap = f"{r['stochastic_gap']:.1f}" if 'stochastic_gap' in r else "?"
             print(f"{r['problem']:<10} {opt:<10} {r['greedy_profit']:<10.0f} {g_gap:<8} {r['stochastic_profit']:<10.0f} {s_gap:<8}")
+    
+    # Save evaluation log
+    if all_results:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if len(all_results) == 1:
+            log_name = f"eval_{all_results[0]['problem']}_{timestamp}.json"
+        else:
+            log_name = f"eval_all_{timestamp}.json"
+        log_path = os.path.join(LOG_DIR, log_name)
+        
+        log_data = {
+            "type": "evaluation",
+            "timestamp": timestamp,
+            "num_samples": args.samples,
+            "results": []
+        }
+        
+        for r in all_results:
+            entry = {
+                "problem": r['problem'],
+                "items": r['items'],
+                "capacity": r['capacity'],
+                "training_step": r['training_step'],
+                "best_training_profit": float(r['best_training_profit']) if isinstance(r['best_training_profit'], (int, float)) else r['best_training_profit'],
+                "greedy": {
+                    "profit": float(r['greedy_profit']),
+                    "weight": float(r['greedy_weight']),
+                    "items_selected": np.where(r['greedy_state'] == 1)[0].tolist(),
+                },
+                "stochastic": {
+                    "profit": float(r['stochastic_profit']),
+                    "weight": float(r['stochastic_weight']),
+                    "items_selected": np.where(r['stochastic_state'] == 1)[0].tolist() if r['stochastic_state'] is not None else [],
+                },
+            }
+            if 'optimal_profit' in r:
+                entry['optimal_profit'] = float(r['optimal_profit'])
+                entry['optimal_solution'] = r['optimal_solution'].tolist() if hasattr(r['optimal_solution'], 'tolist') else r['optimal_solution']
+                entry['greedy']['gap_percent'] = float(r['greedy_gap'])
+                entry['stochastic']['gap_percent'] = float(r['stochastic_gap'])
+            
+            log_data['results'].append(entry)
+        
+        with open(log_path, "w") as f:
+            json.dump(log_data, f, indent=2)
+        
+        print(f"\nEvaluation log saved to: {log_path}")
 
 
 if __name__ == "__main__":

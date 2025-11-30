@@ -9,6 +9,10 @@ class TrajectoryBalance(nn.Module):
         self.logZ = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, logprobs_f, logprobs_b, logreward):
+        # print("logprobs_f:", logprobs_f)
+        # print("logprobs_b:", logprobs_b)
+        # print("logreward:", logreward)
+        # print("logZ:", self.logZ)
         lhs = self.logZ + logprobs_f
         rhs = logprobs_b + logreward
         diff = lhs - rhs

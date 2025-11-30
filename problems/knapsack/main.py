@@ -13,226 +13,20 @@ sys.path.insert(0, PROJECT_ROOT)
 from problems.knapsack.env import KnapsackEnv
 from problems.knapsack.policy import KnapsackPolicy
 from problems.knapsack.utils import load_knapsack_instance, list_knapsack_instances, get_instance_info
+from problems.knapsack.trainer import train
 from losses.trajectorybalance import TrajectoryBalance
+from losses.detailedbalance import DetailedBalance
+from losses.subtrajectorybalance import SubTrajectoryBalance
 
 
 # Data directory relative to this file
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 
-def sample_trajectory(env, forward_policy, device, epsilon=0.1):
-    """Sample a trajectory with epsilon-greedy exploration."""
-    import random
-    
-    state = env.reset()
-    traj_states, traj_actions = [], []
-
-    done = False
-    while not done:
-        traj_states.append(state.copy())
-
-        logits = forward_policy(state, device=device)
-        mask = torch.tensor(env.allowed_actions(state), dtype=torch.float32, device=device)
-        
-        if mask.sum() == 0:
-            done = True
-            reward = env.reward(state)
-            break
-        
-        if random.random() < epsilon:
-            valid_actions = torch.where(mask > 0)[0]
-            action = valid_actions[torch.randint(len(valid_actions), (1,))].item()
-        else:
-            masked_logits = logits.clone()
-            masked_logits[mask == 0] = float('-inf')
-            probs = torch.softmax(masked_logits, dim=0)
-            action = torch.multinomial(probs, 1).item()
-
-        next_state, reward, done = env.step(state, action)
-        traj_actions.append(action)
-        state = next_state
-
-    traj_states.append(state.copy())
-    return traj_states, traj_actions, reward
-
-
-def compute_logprobs(traj_states, traj_actions, forward_policy, backward_policy, env, device):
-    """Compute forward and backward log probabilities for a trajectory."""
-    import torch.nn.functional as F
-    
-    logprob_f = torch.tensor(0.0, device=device)
-    logprob_b = torch.tensor(0.0, device=device)
-    inf_tensor = torch.tensor(float('-inf'), device=device)
-    
-    for i, action in enumerate(traj_actions):
-        state_before = traj_states[i]
-        state_after = traj_states[i + 1]
-        
-        # Forward
-        logits_f = forward_policy(state_before, device=device)
-        mask_f = torch.tensor(env.allowed_actions(state_before), dtype=torch.float32, device=device)
-        logits_f = torch.where(mask_f > 0, logits_f, inf_tensor)
-        logprob_f = logprob_f + F.log_softmax(logits_f, dim=0)[action]
-        
-        # Backward
-        logits_b = backward_policy(state_after, device=device)
-        backward_mask = torch.zeros(2 * env.N, device=device)
-        decided = state_after != -1
-        for j in np.where(decided)[0]:
-            if state_after[j] == 1:
-                backward_mask[j] = 1.0  # undo select
-            else:
-                backward_mask[env.N + j] = 1.0  # undo skip
-        logits_b = torch.where(backward_mask > 0, logits_b, inf_tensor)
-        logprob_b = logprob_b + F.log_softmax(logits_b, dim=0)[action]
-    
-    return logprob_f, logprob_b
-
-
-def train(env, forward_policy, backward_policy, loss_fn, optimizer,
-          steps=2000, device="cpu", save_dir=None, problem_name=None,
-          batch_size=16, epsilon_start=0.5, log_dir=None):
-    """Training loop for knapsack GFN with batch training."""
-    import json
-    import time
-    from datetime import datetime
-    
-    if save_dir is None:
-        save_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
-    if log_dir is None:
-        log_dir = os.path.join(os.path.dirname(__file__), "logs")
-    
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
-    
-    # Setup logging
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_name = f"{problem_name}_{timestamp}" if problem_name else f"train_{timestamp}"
-    log_path = os.path.join(log_dir, f"{log_name}.jsonl")
-    
-    config = {
-        "type": "config",
-        "problem_name": problem_name,
-        "steps": steps,
-        "batch_size": batch_size,
-        "epsilon_start": epsilon_start,
-        "num_items": env.N,
-        "capacity": env.capacity,
-        "device": str(device),
-        "timestamp": timestamp,
-    }
-    with open(log_path, "w") as f:
-        f.write(json.dumps(config) + "\n")
-    
-    print(f"Logging to: {log_path}")
-    start_time = time.time()
-    
-    reward_history = []
-    profit_history = []
-    loss_history = []
-    best_profit = 0.0
-    best_state = None
-    
-    for step in range(steps):
-        epsilon = max(0.01, epsilon_start * (1 - step / steps))
-        
-        # Sample batch of trajectories
-        batch_losses = []
-        batch_rewards = []
-        batch_profits = []
-        
-        for _ in range(batch_size):
-            traj_states, traj_actions, reward = sample_trajectory(
-                env, forward_policy, device, epsilon=epsilon
-            )
-            
-            final_state = traj_states[-1]
-            profit = env.get_profit(final_state)
-            weight = env.get_weight(final_state)
-            
-            batch_rewards.append(reward)
-            batch_profits.append(profit)
-            
-            if profit > best_profit and weight <= env.capacity:
-                best_profit = profit
-                best_state = final_state.copy()
-            
-            # Compute log probabilities
-            logprob_f, logprob_b = compute_logprobs(
-                traj_states, traj_actions, forward_policy, backward_policy, env, device
-            )
-            
-            # TB loss
-            logreward = torch.log(torch.tensor(reward + 1e-8, device=device))
-            traj_loss = loss_fn(logprob_f, logprob_b, logreward)
-            batch_losses.append(traj_loss)
-        
-        # Cumulative loss: mean over batch
-        cumulative_loss = torch.stack(batch_losses).mean()
-        reward_history.extend(batch_rewards)
-        profit_history.extend(batch_profits)
-        loss_history.append(cumulative_loss.item())
-        
-        optimizer.zero_grad()
-        cumulative_loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(forward_policy.parameters(), max_norm=0.5)
-        torch.nn.utils.clip_grad_norm_(backward_policy.parameters(), max_norm=0.5)
-        torch.nn.utils.clip_grad_norm_([loss_fn.logZ], max_norm=0.5)
-        optimizer.step()
-        
-        if step % 50 == 0:
-            avg_reward = np.mean(reward_history[-50*batch_size:]) if len(reward_history) >= 50*batch_size else np.mean(reward_history)
-            avg_profit = np.mean(profit_history[-50*batch_size:]) if len(profit_history) >= 50*batch_size else np.mean(profit_history)
-            avg_loss = np.mean(loss_history[-50:]) if len(loss_history) >= 50 else np.mean(loss_history)
-            batch_avg_profit = np.mean(batch_profits)
-            elapsed = time.time() - start_time
-            
-            print(f"[{step}] loss={cumulative_loss.item():.4f} (avg={avg_loss:.4f}), "
-                  f"batch_profit={batch_avg_profit:.1f}, avg_profit={avg_profit:.1f}, best={best_profit:.0f}, "
-                  f"eps={epsilon:.3f}", flush=True)
-            
-            # Log to file
-            log_entry = {
-                "type": "step",
-                "step": step,
-                "loss": float(cumulative_loss.item()),
-                "avg_loss": float(avg_loss),
-                "batch_profit": float(batch_avg_profit),
-                "avg_profit": float(avg_profit),
-                "best_profit": float(best_profit),
-                "avg_reward": float(avg_reward),
-                "epsilon": float(epsilon),
-                "logZ": float(loss_fn.logZ.item()),
-                "elapsed_seconds": float(elapsed),
-            }
-            with open(log_path, "a") as f:
-                f.write(json.dumps(log_entry) + "\n")
-        
-        if (step + 1) % 500 == 0:
-            checkpoint = {
-                'step': step + 1,
-                'forward_policy': forward_policy.state_dict(),
-                'backward_policy': backward_policy.state_dict(),
-                'loss_fn': loss_fn.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'best_profit': best_profit,
-                'best_state': best_state,
-                'problem_name': problem_name,
-            }
-            if problem_name:
-                ckpt_name = f'{problem_name}_step_{step+1}.pt'
-            else:
-                ckpt_name = f'checkpoint_step_{step+1}.pt'
-            torch.save(checkpoint, os.path.join(save_dir, ckpt_name))
-            print(f"  -> Saved checkpoint: {ckpt_name}", flush=True)
-    
-    return best_state, best_profit
-
-
 def main():
     parser = argparse.ArgumentParser(description="Train GFlowNet for Knapsack Problem")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate for optimizer")
     parser.add_argument("--problem", type=str, default=None,
                         help="Problem name (e.g., p01, p02). Use --list to see available problems.")
     parser.add_argument("--list", action="store_true",
@@ -241,11 +35,28 @@ def main():
                         help="Number of training steps")
     parser.add_argument("--batch-size", type=int, default=16,
                         help="Number of trajectories per training step")
-    parser.add_argument("--epsilon", type=float, default=0.5,
+    parser.add_argument("--epsilon", type=float, default=0.1,
                         help="Initial epsilon for exploration (decays to 0.01)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature (higher = more exploration)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="Top-P (Nucleus) sampling threshold (0.0-1.0, 1.0 = full softmax)")
+    parser.add_argument("--patience", type=int, default=5000,
+                        help="Early stopping patience (steps without improvement)")
+    parser.add_argument("--loss", type=str, default="TB", choices=["TB", "DB", "SubTB"],
+                        help="Loss function: TB, DB, SubTB")
     parser.add_argument("--hidden-dim", type=int, default=128,
                         help="Hidden dimension for policy networks")
+    parser.add_argument("--save-every", type=int, default=1000,
+                        help="Save checkpoint every N steps (default: 500)")
     args = parser.parse_args()
+    
+    # Loss configuration
+    LOSS_CONFIG = {
+        "SubTB": {"lambda_": 1.0},
+        "DB": {},
+        "TB": {}
+    }
     
     # List available problems
     problems = list_knapsack_instances(DATA_DIR)
@@ -302,15 +113,26 @@ def main():
     forward.set_instance(instance['profits'], instance['weights'], instance['capacity'])
     backward.set_instance(instance['profits'], instance['weights'], instance['capacity'])
     
-    # Loss and optimizer
-    loss_fn = TrajectoryBalance(forward, backward).to(device)
+    # Select loss function
+    if args.loss == "TB":
+        loss_fn = TrajectoryBalance(forward, backward).to(device)
+    elif args.loss == "DB":
+        loss_fn = DetailedBalance(forward, backward).to(device)
+    elif args.loss == "SubTB":
+        loss_params = LOSS_CONFIG.get("SubTB", {})
+        loss_fn = SubTrajectoryBalance(forward, backward, **loss_params).to(device)
+    
+    print(f"Using Loss: {args.loss}")
     
     optimizer = torch.optim.Adam(
         list(forward.parameters()) +
         list(backward.parameters()) +
         list(loss_fn.parameters()),
-        lr=1e-3
+        lr=args.lr
     )
+    
+    # Get optimal profit for early stopping
+    optimal_profit = instance.get('optimal_profit', None)
     
     print(f"Training Knapsack with GFlowNet + TB loss...\n")
     best_state, best_profit = train(
@@ -323,7 +145,12 @@ def main():
         device=device,
         problem_name=args.problem,
         batch_size=args.batch_size,
-        epsilon_start=args.epsilon
+        epsilon_start=args.epsilon,
+        save_every=args.save_every,
+        optimal_profit=optimal_profit,
+        top_p=args.top_p,
+        temperature=args.temperature,
+        early_stop_patience=args.patience
     )
     
     print(f"\n{'='*50}")

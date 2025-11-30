@@ -55,6 +55,35 @@ class GraphColoringEnv(BaseEnv):
         reward = self.reward(next_state) if done else 0.0
         return next_state, reward, done
 
+    def step_batch(self, states, actions):
+        """
+        Vectorized step for a batch of states.
+        states: (B, N) numpy array
+        actions: (B,) numpy array
+        """
+        B, N = states.shape
+        K = self.K
+        
+        nodes = actions // K
+        colors = actions % K
+        
+        next_states = states.copy()
+        # Advanced indexing for batch update
+        # next_states[range(B), nodes] = colors
+        # But nodes is (B,), colors is (B,)
+        next_states[np.arange(B), nodes] = colors
+        
+        # Check done (only fully colored check here, stuck check handled by sampler)
+        dones = (next_states != -1).all(axis=1)
+        
+        # Compute rewards for done states
+        rewards = np.zeros(B, dtype=np.float32)
+        if dones.any():
+            done_states = next_states[dones]
+            rewards[dones] = self.reward_batch(done_states)
+            
+        return next_states, rewards, dones
+
     def is_terminal(self, state):
         # Terminal if all nodes are colored
         if np.all(state != -1):
@@ -64,31 +93,62 @@ class GraphColoringEnv(BaseEnv):
         return mask.sum() == 0
 
     def reward(self, state):
-        # Vectorized conflict counting
+        # Single state reward
         colored_mask = state != -1
         same_color = (state[:, None] == state[None, :]) & colored_mask[:, None] & colored_mask[None, :]
         conflicts = int(np.sum(self._adj_np * same_color) // 2)
         
-        # Count colored nodes and colors used
         colored = np.sum(colored_mask)
         colors_used = len(set(c for c in state if c != -1)) if colored > 0 else 0
-        # if colored == self.N and conflicts == 0:
-        #     return float(np.exp(-colors_used))
-        # else:
-        #     return float(0.0)
-        if colored == self.N and conflicts == 0:
-            # Valid complete coloring - reward fewer colors
-            # Scale: exp(N/colors_used) so logreward ≈ N/colors_used (same scale as logprobs)
-            # For N=23, colors=5: reward = exp(4.6) ≈ 100, logreward ≈ 4.6
-            # For N=23, colors=23: reward = exp(1) ≈ 2.7, logreward ≈ 1
-            return float(np.exp(self.N / colors_used))
-        elif colored == self.N and conflicts > 0:
-            # Complete but invalid - penalize conflicts
-            return float(np.exp(-conflicts))
-        else:
-            # Partial coloring - small reward
-            progress = colored / self.N
-            return float(np.exp(-10 + progress * 5))  # logreward in [-10, -5] range
+        missing = self.N - colored
+
+        # logR as a smooth function
+        alpha = 1.0   # penalty per conflict
+        beta  = 0.5   # penalty per color used
+        gamma = 0.2   # penalty per uncolored node
+
+        logR = -alpha * conflicts - beta * colors_used - gamma * missing
+        
+        # Scale by N to match log_pf magnitude
+        logR = logR * self.N
+
+        return float(logR)
+
+    def reward_batch(self, states):
+        """Vectorized reward for batch of states (B, N)."""
+        B, N = states.shape
+        
+        colored_mask = (states != -1) # (B, N)
+        
+        # same_color: (B, N, N)
+        same_color = (states[:, :, None] == states[:, None, :]) & \
+                     colored_mask[:, :, None] & \
+                     colored_mask[:, None, :]
+                     
+        # Conflicts: sum(adj * same_color)
+        adj_broadcast = self._adj_np[None, :, :]
+        conflicts = np.sum(adj_broadcast * same_color, axis=(1, 2)) // 2 # (B,)
+        
+        # Colors used: (B,)
+        colors_used = np.zeros(B, dtype=np.float32)
+        for k in range(self.K):
+            has_color = (states == k).any(axis=1)
+            colors_used += has_color
+            
+        colored_counts = colored_mask.sum(axis=1)
+        missing = N - colored_counts
+        
+        # Parameters
+        alpha = 1.0
+        beta = 0.5
+        gamma = 0.2
+        
+        logR = -alpha * conflicts - beta * colors_used - gamma * missing
+        
+        # Scale by N
+        logR = logR * N
+        
+        return logR
 
     def encode_state(self, state):
         one_hot = np.zeros((self.N, self.K), dtype=np.float32)
