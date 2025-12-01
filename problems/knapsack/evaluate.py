@@ -12,8 +12,8 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from problems.knapsack.env import KnapsackEnv
-from problems.knapsack.policy import KnapsackPolicy
+from problems.knapsack.env import KnapsackEnv, ConditionalKnapsackEnv
+from problems.knapsack.policy import KnapsackPolicy, ConditionalKnapsackPolicy, ConditionalKnapsackPolicyWrapper
 from problems.knapsack.utils import load_knapsack_instance, list_knapsack_instances, get_instance_info
 
 # Data and checkpoint directories relative to this file
@@ -258,6 +258,30 @@ def main():
                 print(f"  Optimal: {results['optimal_profit']:.0f}")
                 print(f"  Greedy gap: {results['greedy_gap']:.2f}%")
                 print(f"  Stochastic gap: {results['stochastic_gap']:.2f}%")
+            
+            # Output best solution
+            print()
+            print("  " + "=" * 50)
+            print("  BEST SOLUTION")
+            print("  " + "=" * 50)
+            best_state = results['stochastic_state']
+            best_profit = results['stochastic_profit']
+            best_weight = results['stochastic_weight']
+            
+            is_valid = best_weight <= results['capacity']
+            is_optimal = is_valid and 'optimal_profit' in results and best_profit >= results['optimal_profit']
+            
+            status = "OPTIMAL" if is_optimal else ("VALID" if is_valid else "INVALID")
+            opt_str = f"/{results['optimal_profit']:.0f}" if 'optimal_profit' in results else ""
+            gap_str = f" (gap: {results['stochastic_gap']:.2f}%)" if 'stochastic_gap' in results else ""
+            
+            print(f"  Status: {status}")
+            print(f"  Profit: {best_profit:.0f}{opt_str}{gap_str}")
+            print(f"  Weight: {best_weight:.0f}/{results['capacity']}")
+            if best_state is not None:
+                items_selected = np.where(best_state == 1)[0].tolist()
+                print(f"  Items selected: {items_selected}")
+                print(f"  Selection vector: {best_state.tolist()}")
                 
         except Exception as e:
             print(f"  Error: {e}")
@@ -325,5 +349,356 @@ def main():
         print(f"\nEvaluation log saved to: {log_path}")
 
 
+# ============================================================================
+# Conditional Evaluation Functions
+# ============================================================================
+
+def create_conditional_policy_from_checkpoint(checkpoint, device):
+    """
+    Create a ConditionalKnapsackPolicy from checkpoint, handling both old and new formats.
+    
+    Returns:
+        shared_policy: The underlying ConditionalKnapsackPolicy
+        hidden_dim: Hidden dimension
+        num_layers: Number of attention layers
+    """
+    forward_state = checkpoint['forward_policy']
+    
+    # Check if keys have 'shared_policy.' prefix (new format) or not (old format)
+    sample_key = list(forward_state.keys())[0]
+    has_prefix = sample_key.startswith('shared_policy.')
+    
+    # Find hidden dim from item_encoder
+    if has_prefix:
+        encoder_key = 'shared_policy.item_encoder.0.weight'
+    else:
+        encoder_key = 'item_encoder.0.weight'
+    
+    hidden_dim = forward_state[encoder_key].shape[0]
+    
+    # Count attention layers
+    if has_prefix:
+        attn_prefix = 'shared_policy.attention_layers.'
+    else:
+        attn_prefix = 'attention_layers.'
+    
+    num_layers = 0
+    for key in forward_state.keys():
+        if attn_prefix in key:
+            after_prefix = key.split(attn_prefix)[1]
+            layer_idx = int(after_prefix.split('.')[0])
+            num_layers = max(num_layers, layer_idx + 1)
+    
+    # Create policy
+    shared_policy = ConditionalKnapsackPolicy(
+        hidden_dim=hidden_dim,
+        num_layers=num_layers
+    ).to(device)
+    
+    if has_prefix:
+        # New format: load via wrapper
+        forward = ConditionalKnapsackPolicyWrapper(shared_policy, mode='forward')
+        forward.load_state_dict(forward_state)
+        forward.eval()
+        return shared_policy, hidden_dim, num_layers
+    else:
+        # Old format: load directly
+        shared_policy.load_state_dict(forward_state)
+        shared_policy.eval()
+        return shared_policy, hidden_dim, num_layers
+
+
+def sample_greedy_conditional(env, policy, instance, device):
+    """Sample a solution using greedy (argmax) policy for conditional model."""
+    state = env.reset()
+    profits = instance['profits']
+    weights = instance['weights']
+    capacity = instance['capacity']
+    
+    with torch.no_grad():
+        while True:
+            logits = policy(state, profits, weights, capacity, device=device)
+            mask = torch.tensor(env.allowed_actions(state), dtype=torch.float32, device=device)
+            
+            if mask.sum() == 0:
+                break
+            
+            masked_logits = logits.clone()
+            masked_logits[mask == 0] = float('-inf')
+            action = masked_logits.argmax().item()
+            
+            state, reward, done = env.step(state, action)
+            if done:
+                break
+    
+    return state, reward
+
+
+def sample_stochastic_conditional(env, policy, instance, device, num_samples=100):
+    """Sample multiple solutions stochastically for conditional model."""
+    best_state = None
+    best_profit = -float('inf')
+    
+    profits = instance['profits']
+    weights = instance['weights']
+    capacity = instance['capacity']
+    
+    with torch.no_grad():
+        for _ in range(num_samples):
+            state = env.reset()
+            
+            while True:
+                logits = policy(state, profits, weights, capacity, device=device)
+                mask = torch.tensor(env.allowed_actions(state), dtype=torch.float32, device=device)
+                
+                if mask.sum() == 0:
+                    break
+                
+                masked_logits = logits.clone()
+                masked_logits[mask == 0] = float('-inf')
+                probs = torch.softmax(masked_logits, dim=0)
+                action = torch.multinomial(probs, 1).item()
+                
+                state, reward, done = env.step(state, action)
+                if done:
+                    break
+            
+            profit = env.get_profit(state)
+            weight = env.get_weight(state)
+            
+            if weight <= capacity and profit > best_profit:
+                best_profit = profit
+                best_state = state.copy()
+    
+    return best_state, best_profit
+
+
+def evaluate_conditional(args):
+    """Evaluate a conditional GFlowNet model on knapsack problems."""
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}\n")
+    
+    problems = list_knapsack_instances(DATA_DIR)
+    
+    # Load checkpoint
+    if not args.checkpoint or not os.path.exists(args.checkpoint):
+        print(f"Error: Checkpoint not found: {args.checkpoint}")
+        return
+    
+    print(f"Loading checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    
+    # Create policy from checkpoint
+    shared_policy, hidden_dim, num_layers = create_conditional_policy_from_checkpoint(checkpoint, device)
+    
+    print(f"Loaded conditional model:")
+    print(f"  Hidden dim: {hidden_dim}")
+    print(f"  Attention layers: {num_layers}")
+    print(f"  Training step: {checkpoint.get('step', '?')}")
+    print()
+    
+    # Determine which problems to evaluate
+    if args.all:
+        eval_problems = problems
+    elif args.problems:
+        eval_problems = args.problems
+        for name in eval_problems:
+            if name not in problems:
+                print(f"Error: Problem '{name}' not found.")
+                return
+    else:
+        print("Available Knapsack Problems:")
+        print("-" * 60)
+        print(f"{'Problem':<10} {'Items':<8} {'Capacity':<12} {'Optimal':<10}")
+        print("-" * 60)
+        for p in problems:
+            info = get_instance_info(DATA_DIR, p)
+            opt = f"{info['optimal_profit']:.0f}" if info['optimal_profit'] else "?"
+            print(f"{p:<10} {info['items']:<8} {info['capacity']:<12} {opt:<10}")
+        print("-" * 60)
+        print("\nUse --problems <name1> <name2> ... to evaluate specific problems")
+        print("Use --all to evaluate all problems")
+        return
+    
+    # Evaluate each problem
+    print("=" * 80)
+    print("CONDITIONAL GFLOWNET EVALUATION")
+    print("=" * 80)
+    
+    all_results = []
+    
+    for problem_name in eval_problems:
+        instance = load_knapsack_instance(DATA_DIR, problem_name)
+        N = len(instance['profits'])
+        
+        # Create environment for this instance
+        env = KnapsackEnv(instance)
+        
+        print(f"\n[{problem_name}] {N} items, capacity {instance['capacity']}")
+        
+        # Greedy evaluation
+        greedy_state, greedy_reward = sample_greedy_conditional(env, shared_policy, instance, device)
+        greedy_profit = env.get_profit(greedy_state)
+        greedy_weight = env.get_weight(greedy_state)
+        
+        # Stochastic evaluation
+        stoch_state, stoch_profit = sample_stochastic_conditional(
+            env, shared_policy, instance, device, args.samples
+        )
+        stoch_weight = env.get_weight(stoch_state) if stoch_state is not None else 0
+        
+        # Results
+        results = {
+            'problem': problem_name,
+            'items': N,
+            'capacity': instance['capacity'],
+            'greedy_profit': float(greedy_profit),
+            'greedy_weight': float(greedy_weight),
+            'stochastic_profit': float(stoch_profit) if stoch_profit else 0,
+            'stochastic_weight': float(stoch_weight),
+            'greedy_state': greedy_state,
+            'stochastic_state': stoch_state,
+        }
+        
+        if 'optimal_profit' in instance:
+            results['optimal_profit'] = float(instance['optimal_profit'])
+            results['greedy_gap'] = float((instance['optimal_profit'] - greedy_profit) / instance['optimal_profit'] * 100)
+            results['stochastic_gap'] = float((instance['optimal_profit'] - stoch_profit) / instance['optimal_profit'] * 100) if stoch_profit else 100.0
+        
+        all_results.append(results)
+        
+        # Print results
+        greedy_valid = greedy_weight <= instance['capacity']
+        stoch_valid = stoch_weight <= instance['capacity'] if stoch_state is not None else False
+        
+        greedy_mark = "✓" if greedy_valid else "✗"
+        stoch_mark = "✓" if stoch_valid else "✗"
+        
+        opt_str = f"/{instance['optimal_profit']:.0f}" if 'optimal_profit' in instance else ""
+        greedy_gap_str = f" (gap: {results['greedy_gap']:.1f}%)" if 'greedy_gap' in results else ""
+        stoch_gap_str = f" (gap: {results['stochastic_gap']:.1f}%)" if 'stochastic_gap' in results else ""
+        
+        print(f"  Greedy:     {greedy_profit:.0f}{opt_str} profit, {greedy_weight:.0f}/{instance['capacity']} weight {greedy_mark}{greedy_gap_str}")
+        print(f"  Stochastic: {stoch_profit:.0f}{opt_str} profit, {stoch_weight:.0f}/{instance['capacity']} weight {stoch_mark}{stoch_gap_str}")
+    
+    # Summary
+    if len(all_results) > 1:
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"{'Problem':<10} {'Optimal':<10} {'Greedy':<10} {'Gap%':<8} {'Stoch':<10} {'Gap%':<8}")
+        print("-" * 60)
+        for r in all_results:
+            opt = f"{r.get('optimal_profit', '?'):.0f}" if 'optimal_profit' in r else "?"
+            g_gap = f"{r['greedy_gap']:.1f}" if 'greedy_gap' in r else "?"
+            s_gap = f"{r['stochastic_gap']:.1f}" if 'stochastic_gap' in r else "?"
+            print(f"{r['problem']:<10} {opt:<10} {r['greedy_profit']:<10.0f} {g_gap:<8} {r['stochastic_profit']:<10.0f} {s_gap:<8}")
+        
+        # Average gaps
+        if any('greedy_gap' in r for r in all_results):
+            avg_greedy_gap = np.mean([r['greedy_gap'] for r in all_results if 'greedy_gap' in r])
+            avg_stoch_gap = np.mean([r['stochastic_gap'] for r in all_results if 'stochastic_gap' in r])
+            print("-" * 60)
+            print(f"{'Average':<10} {'':<10} {'':<10} {avg_greedy_gap:<8.1f} {'':<10} {avg_stoch_gap:<8.1f}")
+    
+    # Print best solutions
+    print("\n" + "=" * 80)
+    print("BEST SOLUTIONS (Stochastic)")
+    print("=" * 80)
+    for r in all_results:
+        print(f"\n{r['problem']}:")
+        stoch_state = r['stochastic_state']
+        stoch_profit = r['stochastic_profit']
+        stoch_weight = r['stochastic_weight']
+        capacity = r['capacity']
+        
+        is_valid = stoch_weight <= capacity
+        is_optimal = is_valid and 'optimal_profit' in r and stoch_profit >= r['optimal_profit']
+        
+        status = "OPTIMAL" if is_optimal else ("VALID" if is_valid else "INVALID")
+        opt_str = f"/{r['optimal_profit']:.0f}" if 'optimal_profit' in r else ""
+        gap_str = f" (gap: {r['stochastic_gap']:.1f}%)" if 'stochastic_gap' in r else ""
+        
+        print(f"  Status: {status}")
+        print(f"  Profit: {stoch_profit:.0f}{opt_str}{gap_str}")
+        print(f"  Weight: {stoch_weight:.0f}/{capacity}")
+        if stoch_state is not None:
+            items_selected = np.where(stoch_state == 1)[0].tolist()
+            print(f"  Items selected: {items_selected}")
+            print(f"  Selection vector: {stoch_state.tolist()}")
+    
+    # Save evaluation log
+    if all_results:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_name = f"eval_conditional_{timestamp}.json"
+        log_path = os.path.join(LOG_DIR, log_name)
+        
+        log_data = {
+            "type": "conditional_evaluation",
+            "timestamp": timestamp,
+            "checkpoint": args.checkpoint,
+            "num_samples": args.samples,
+            "results": []
+        }
+        
+        for r in all_results:
+            entry = {
+                "problem": r['problem'],
+                "items": r['items'],
+                "capacity": r['capacity'],
+                "greedy": {
+                    "profit": r['greedy_profit'],
+                    "weight": r['greedy_weight'],
+                    "items_selected": np.where(r['greedy_state'] == 1)[0].tolist(),
+                },
+                "stochastic": {
+                    "profit": r['stochastic_profit'],
+                    "weight": r['stochastic_weight'],
+                    "items_selected": np.where(r['stochastic_state'] == 1)[0].tolist() if r['stochastic_state'] is not None else [],
+                },
+            }
+            if 'optimal_profit' in r:
+                entry['optimal_profit'] = r['optimal_profit']
+                entry['greedy']['gap_percent'] = r['greedy_gap']
+                entry['stochastic']['gap_percent'] = r['stochastic_gap']
+            
+            log_data['results'].append(entry)
+        
+        with open(log_path, "w") as f:
+            json.dump(log_data, f, indent=2)
+        
+        print(f"\nEvaluation log saved to: {log_path}")
+
+
+def main_wrapper():
+    """Entry point that dispatches to single or conditional evaluation."""
+    parser = argparse.ArgumentParser(description="Evaluate trained GFlowNet on Knapsack problems")
+    parser.add_argument("--problem", type=str, default=None,
+                        help="Problem name to evaluate. If not specified, lists available problems.")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint file. If not specified, uses latest in checkpoints/")
+    parser.add_argument("--samples", type=int, default=100,
+                        help="Number of stochastic samples for evaluation")
+    parser.add_argument("--hidden-dim", type=int, default=128,
+                        help="Hidden dimension (must match training)")
+    parser.add_argument("--all", action="store_true",
+                        help="Evaluate all problems (requires matching checkpoints)")
+    
+    # Conditional evaluation arguments
+    parser.add_argument("--conditional", action="store_true",
+                        help="Evaluate conditional GFlowNet model")
+    parser.add_argument("--problems", type=str, nargs="+", default=None,
+                        help="[Conditional] List of problem names to evaluate")
+    
+    args = parser.parse_args()
+    
+    if args.conditional:
+        evaluate_conditional(args)
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    main_wrapper()

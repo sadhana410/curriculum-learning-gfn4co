@@ -10,10 +10,10 @@ import torch
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
-from problems.knapsack.env import KnapsackEnv
-from problems.knapsack.policy import KnapsackPolicy
+from problems.knapsack.env import KnapsackEnv, ConditionalKnapsackEnv, KnapsackInstanceDataset
+from problems.knapsack.policy import KnapsackPolicy, ConditionalKnapsackPolicy, ConditionalKnapsackPolicyWrapper
 from problems.knapsack.utils import load_knapsack_instance, list_knapsack_instances, get_instance_info
-from problems.knapsack.trainer import train
+from problems.knapsack.trainer import train, train_conditional
 from losses.trajectorybalance import TrajectoryBalance
 from losses.detailedbalance import DetailedBalance
 from losses.subtrajectorybalance import SubTrajectoryBalance
@@ -21,6 +21,8 @@ from losses.subtrajectorybalance import SubTrajectoryBalance
 
 # Data directory relative to this file
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 
 
 def main():
@@ -49,6 +51,19 @@ def main():
                         help="Hidden dimension for policy networks")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="Save checkpoint every N steps (default: 500)")
+    
+    # Conditional training arguments
+    parser.add_argument("--conditional", action="store_true",
+                        help="Use conditional GFlowNet (train on multiple instances)")
+    parser.add_argument("--problems", type=str, nargs="+", default=None,
+                        help="[Conditional] List of problem names to train on")
+    parser.add_argument("--all-problems", action="store_true",
+                        help="[Conditional] Train on all available problems")
+    parser.add_argument("--num-layers", type=int, default=3,
+                        help="[Conditional] Number of attention layers in policy")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="[Conditional] Resume from checkpoint (path or 'latest')")
+    
     args = parser.parse_args()
     
     # Loss configuration
@@ -167,5 +182,166 @@ def main():
         print(f"  Gap to optimal: {gap:.2f}%")
 
 
+def main_conditional(args):
+    """Conditional GFlowNet training on multiple knapsack instances."""
+    
+    # Loss configuration
+    LOSS_CONFIG = {
+        "SubTB": {"lambda_": 1.0},
+        "DB": {},
+        "TB": {}
+    }
+    
+    problems = list_knapsack_instances(DATA_DIR)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print()
+    
+    # Determine which instances to use
+    if args.all_problems:
+        instance_names = problems
+    elif args.problems:
+        instance_names = args.problems
+        # Validate
+        for name in instance_names:
+            if name not in problems:
+                print(f"Error: Problem '{name}' not found.")
+                print(f"Available: {problems}")
+                return
+    else:
+        # Default: use first 3 problems
+        instance_names = problems[:3]
+        print(f"No problems specified, using first 3: {instance_names}")
+    
+    # Load instances
+    instances = []
+    for name in instance_names:
+        inst = load_knapsack_instance(DATA_DIR, name)
+        instances.append(inst)
+    
+    print(f"Loaded {len(instances)} instances:")
+    for inst in instances:
+        N = len(inst['profits'])
+        opt = f" (optimal: {inst['optimal_profit']:.0f})" if 'optimal_profit' in inst else ""
+        print(f"  {inst['name']}: {N} items, capacity {inst['capacity']}{opt}")
+    print()
+    
+    # Create conditional environment
+    env = ConditionalKnapsackEnv(instances)
+    
+    # Create conditional policy with shared backbone
+    shared_policy = ConditionalKnapsackPolicy(
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers
+    ).to(device)
+    
+    # Create wrappers for forward and backward
+    forward = ConditionalKnapsackPolicyWrapper(shared_policy, mode='forward')
+    backward = ConditionalKnapsackPolicyWrapper(shared_policy, mode='backward')
+    
+    # Select loss function
+    if args.loss == "TB":
+        loss_fn = TrajectoryBalance(forward, backward).to(device)
+    elif args.loss == "DB":
+        loss_fn = DetailedBalance(forward, backward).to(device)
+    elif args.loss == "SubTB":
+        loss_params = LOSS_CONFIG.get("SubTB", {})
+        loss_fn = SubTrajectoryBalance(forward, backward, **loss_params).to(device)
+    
+    print(f"Using Loss: {args.loss}")
+    
+    optimizer = torch.optim.Adam(
+        list(shared_policy.parameters()) +
+        list(loss_fn.parameters()),
+        lr=args.lr
+    )
+    
+    # Build problem name for checkpoints
+    if args.all_problems:
+        problem_name = "conditional_all"
+    elif args.problems:
+        prob_names = "-".join(sorted(args.problems))
+        if len(prob_names) > 50:
+            prob_names = prob_names[:47] + "..."
+        problem_name = f"conditional_{prob_names}"
+    else:
+        problem_name = "conditional_default"
+    
+    print(f"Training Conditional Knapsack GFlowNet...\n")
+    best_per_instance = train_conditional(
+        env=env,
+        forward_policy=forward,
+        backward_policy=backward,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        steps=args.steps,
+        device=device,
+        save_dir=CHECKPOINT_DIR,
+        log_dir=LOG_DIR,
+        problem_name=problem_name,
+        batch_size=args.batch_size,
+        epsilon_start=args.epsilon,
+        save_every=args.save_every,
+        early_stop_patience=args.patience,
+        top_p=args.top_p,
+        temperature=args.temperature,
+        resume_from=args.resume
+    )
+    
+    print(f"\n{'='*50}")
+    print(f"Conditional Training complete!")
+
+
+def main_wrapper():
+    """Entry point that dispatches to single or conditional training."""
+    parser = argparse.ArgumentParser(description="Train GFlowNet for Knapsack Problem")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Learning rate for optimizer")
+    parser.add_argument("--problem", type=str, default=None,
+                        help="Problem name (e.g., p01, p02). Use --list to see available problems.")
+    parser.add_argument("--list", action="store_true",
+                        help="List all available problems and exit")
+    parser.add_argument("--steps", type=int, default=5000,
+                        help="Number of training steps")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Number of trajectories per training step")
+    parser.add_argument("--epsilon", type=float, default=0.1,
+                        help="Initial epsilon for exploration (decays to 0.01)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Sampling temperature (higher = more exploration)")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="Top-P (Nucleus) sampling threshold (0.0-1.0, 1.0 = full softmax)")
+    parser.add_argument("--patience", type=int, default=5000,
+                        help="Early stopping patience (steps without improvement)")
+    parser.add_argument("--loss", type=str, default="TB", choices=["TB", "DB", "SubTB"],
+                        help="Loss function: TB, DB, SubTB")
+    parser.add_argument("--hidden-dim", type=int, default=128,
+                        help="Hidden dimension for policy networks")
+    parser.add_argument("--save-every", type=int, default=1000,
+                        help="Save checkpoint every N steps (default: 500)")
+    
+    # Conditional training arguments
+    parser.add_argument("--conditional", action="store_true",
+                        help="Use conditional GFlowNet (train on multiple instances)")
+    parser.add_argument("--problems", type=str, nargs="+", default=None,
+                        help="[Conditional] List of problem names to train on")
+    parser.add_argument("--all-problems", action="store_true",
+                        help="[Conditional] Train on all available problems")
+    parser.add_argument("--num-layers", type=int, default=3,
+                        help="[Conditional] Number of attention layers in policy")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="[Conditional] Resume from checkpoint (path or 'latest')")
+    
+    args = parser.parse_args()
+    
+    if args.conditional:
+        main_conditional(args)
+    else:
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    main_wrapper()

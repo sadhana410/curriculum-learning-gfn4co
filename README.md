@@ -25,16 +25,28 @@ curriculum-learning-gfn4co/
 │   │   ├── trainer.py           # Training loop with early stopping
 │   │   ├── utils.py             # Graph loading utilities
 │   │   ├── main.py              # Training script
+│   │   ├── train_curriculum.py  # Curriculum learning script
 │   │   └── evaluate.py          # Evaluation script
-│   └── knapsack/
-│       ├── data/                # Knapsack instances (p01/, p02/, ...)
+│   ├── knapsack/
+│   │   ├── data/                # Knapsack instances (p01/, p02/, ...)
+│   │   ├── checkpoints/         # Saved model checkpoints
+│   │   ├── logs/                # Training logs (JSONL)
+│   │   ├── env.py               # Knapsack environment
+│   │   ├── policy.py            # MLP policy network
+│   │   ├── sampler.py           # Trajectory sampler
+│   │   ├── trainer.py           # Training loop with early stopping
+│   │   ├── utils.py             # Instance loading utilities
+│   │   ├── main.py              # Training script
+│   │   └── evaluate.py          # Evaluation script
+│   └── tsp/
+│       ├── data/                # TSP instances (.tsp files in TSPLIB format)
 │       ├── checkpoints/         # Saved model checkpoints
 │       ├── logs/                # Training logs (JSONL)
-│       ├── env.py               # Knapsack environment
-│       ├── policy.py            # MLP policy network
+│       ├── env.py               # TSP environment
+│       ├── policy.py            # Attention-based policy network
 │       ├── sampler.py           # Trajectory sampler
 │       ├── trainer.py           # Training loop with early stopping
-│       ├── utils.py             # Instance loading utilities
+│       ├── utils.py             # TSPLIB loading utilities
 │       ├── main.py              # Training script
 │       └── evaluate.py          # Evaluation script
 ```
@@ -87,6 +99,33 @@ python problems/graph_coloring/main.py --conditional --random-graphs 50 --min-no
 python problems/graph_coloring/main.py --conditional --graphs myciel3 myciel4 --resume latest
 python problems/graph_coloring/main.py --conditional --graphs myciel3 myciel4 --resume checkpoints/conditional_K47_step_5000.pt
 ```
+
+#### Curriculum Learning
+
+Train with curriculum learning, gradually adding harder graphs (myciel2 → myciel3 → ... → myciel7):
+
+```bash
+# Full curriculum (all stages: myciel2 -> myciel7)
+python problems/graph_coloring/train_curriculum.py --steps-per-stage 5000 --max-colors 191
+
+# Partial curriculum (up to myciel5)
+python problems/graph_coloring/train_curriculum.py --stages myciel2 myciel3 myciel4 myciel5 --steps-per-stage 5000
+
+# Custom training parameters
+python problems/graph_coloring/train_curriculum.py --steps-per-stage 10000 --batch-size 64 --lr 5e-4 --loss SubTB
+```
+
+**How it works:**
+1. **Stage 1**: Train on myciel2 only
+2. **Stage 2**: Add myciel3, resume from Stage 1 checkpoint
+3. **Stage 3**: Add myciel4, resume from Stage 2 checkpoint
+4. ... and so on until all stages are complete
+
+Each stage trains for `--steps-per-stage` steps, then saves a checkpoint and moves to the next stage. The policy learns easier graphs first, then progressively harder ones.
+
+**Curriculum Arguments:**
+- `--stages`: Specific stages to train (default: myciel2 through myciel7)
+- `--steps-per-stage`: Training steps per stage (default: 5000)
 
 **Common Arguments:**
 - `--steps`: Number of training steps (default: 10000)
@@ -152,9 +191,16 @@ python problems/graph_coloring/evaluate.py --conditional --checkpoint checkpoint
 - `--all-graphs`: Evaluate on all graphs
 - `--samples`: Number of stochastic samples (default: 100)
 
+**Output:** Evaluation outputs the best solution found from stochastic sampling, including:
+- Status (OPTIMAL/VALID/INVALID)
+- Colors used and conflicts
+- Full coloring vector (node → color mapping)
+
 ### Knapsack
 
-Train GFlowNet on knapsack instances:
+#### Single-Instance Training
+
+Train GFlowNet on a single knapsack instance:
 
 ```bash
 # List available problems
@@ -168,9 +214,23 @@ python problems/knapsack/main.py --problem p02 --steps 5000
 python problems/knapsack/main.py --problem p01 --batch-size 32 --epsilon 0.2 --loss SubTB --steps 3000
 ```
 
-**Arguments:**
-- `--problem`: Problem name (e.g., p01, p02). Required.
-- `--list`: List all available problems and exit
+#### Conditional GFlowNet Training
+
+Train a single policy that generalizes across multiple knapsack instances:
+
+```bash
+# Train on specific problems
+python problems/knapsack/main.py --conditional --problems p01 p02 p03 --steps 10000
+
+# Train on all available problems
+python problems/knapsack/main.py --conditional --all-problems --steps 20000
+
+# Resume training from checkpoint
+python problems/knapsack/main.py --conditional --problems p01 p02 --resume latest
+python problems/knapsack/main.py --conditional --problems p01 p02 --resume checkpoints/conditional_p01-p02_step_5000.pt
+```
+
+**Common Arguments:**
 - `--steps`: Number of training steps (default: 5000)
 - `--batch-size`: Number of trajectories per training step (default: 16)
 - `--epsilon`: Initial epsilon for exploration, decays to 0.01 (default: 0.1)
@@ -181,29 +241,163 @@ python problems/knapsack/main.py --problem p01 --batch-size 32 --epsilon 0.2 --l
 - `--hidden-dim`: Hidden dimension for policy networks (default: 128)
 - `--save-every`: Save checkpoint every N steps (default: 1000)
 
+**Single-Instance Arguments:**
+- `--problem`: Problem name (e.g., p01, p02). Required for single-instance mode.
+- `--list`: List all available problems and exit
+
+**Conditional Arguments:**
+- `--conditional`: Enable conditional GFlowNet mode
+- `--problems`: Specific problem names to train on (e.g., p01 p02 p03)
+- `--all-problems`: Train on all problems in data directory
+- `--num-layers`: Number of attention layers in policy (default: 3)
+- `--resume`: Resume from checkpoint (path or 'latest')
+
 Training logs are saved to `problems/knapsack/logs/` in JSON Lines format.
+
+#### Checkpoints
+
+The training saves three types of checkpoints:
+- **Periodic**: `{name}_step_{N}.pt` - Saved every `--save-every` steps
+- **Best**: `{name}_best.pt` - Saved when average gap improves
+- **Final**: `{name}_final.pt` - Saved at end of training
 
 #### Evaluation
 
 Evaluate trained models on knapsack problems:
 
 ```bash
-# List available problems
-python problems/knapsack/evaluate.py
-
-# Evaluate on a specific problem
+# Single-instance evaluation
+python problems/knapsack/evaluate.py                                    # List available problems
 python problems/knapsack/evaluate.py --problem p01 --samples 100
-
-# Evaluate with specific checkpoint
 python problems/knapsack/evaluate.py --problem p01 --checkpoint path/to/checkpoint.pt
+
+# Conditional evaluation (evaluate on multiple/unseen problems)
+python problems/knapsack/evaluate.py --conditional --checkpoint checkpoints/conditional_p01-p02-p03_best.pt --problems p01 p02 p03
+python problems/knapsack/evaluate.py --conditional --checkpoint checkpoints/conditional_all_best.pt --all
 ```
 
-**Evaluation Arguments:**
+**Single-Instance Evaluation Arguments:**
 - `--problem`: Problem name to evaluate
 - `--checkpoint`: Path to checkpoint (default: latest in checkpoints/)
 - `--samples`: Number of stochastic samples (default: 100)
 - `--hidden-dim`: Hidden dimension (must match training, default: 128)
 - `--all`: Evaluate all problems with matching checkpoints
+
+**Conditional Evaluation Arguments:**
+- `--conditional`: Enable conditional evaluation mode
+- `--checkpoint`: Path to conditional checkpoint
+- `--problems`: Specific problems to evaluate
+- `--all`: Evaluate on all problems
+- `--samples`: Number of stochastic samples (default: 100)
+
+**Output:** Evaluation outputs the best solution found from stochastic sampling, including:
+- Status (OPTIMAL/VALID/INVALID)
+- Profit and weight
+- Items selected (indices and selection vector)
+
+### Traveling Salesman Problem (TSP)
+
+#### Single-Instance Training
+
+Train GFlowNet on a TSP instance:
+
+```bash
+# List available problems
+python problems/tsp/main.py --list
+
+# Train on a TSPLIB file
+python problems/tsp/main.py --problem p_all --steps 5000
+
+# Train on a randomly generated instance
+python problems/tsp/main.py --random --num-cities 20 --steps 5000
+python problems/tsp/main.py --random --num-cities 50 --seed 42 --steps 10000
+
+# Train with custom batch size, exploration, and loss function
+python problems/tsp/main.py --random --num-cities 30 --batch-size 32 --epsilon 0.2 --loss SubTB --steps 5000
+```
+
+#### Conditional GFlowNet Training
+
+Train a single policy that generalizes across multiple TSP instances:
+
+```bash
+# Train on randomly generated instances
+python problems/tsp/main.py --conditional --num-instances 10 --min-cities 10 --max-cities 30 --steps 10000
+
+# Train with more instances and larger cities
+python problems/tsp/main.py --conditional --num-instances 50 --min-cities 20 --max-cities 50 --steps 20000
+
+# Resume training from checkpoint
+python problems/tsp/main.py --conditional --num-instances 10 --resume latest
+```
+
+**Common Arguments:**
+- `--steps`: Number of training steps (default: 5000)
+- `--batch-size`: Number of trajectories per training step (default: 16)
+- `--epsilon`: Initial epsilon for exploration, decays to 0.01 (default: 0.1)
+- `--temperature`: Sampling temperature, higher = more exploration (default: 1.0)
+- `--top-p`: Top-P (Nucleus) sampling threshold (default: 1.0)
+- `--patience`: Early stopping patience in steps (default: 5000)
+- `--loss`: Loss function: TB, DB, or SubTB (default: TB)
+- `--hidden-dim`: Hidden dimension for policy networks (default: 128)
+- `--save-every`: Save checkpoint every N steps (default: 1000)
+
+**Single-Instance Arguments:**
+- `--problem`: Problem name (TSPLIB file in data directory)
+- `--random`: Generate a random TSP instance
+- `--num-cities`: Number of cities for random instance (default: 20)
+- `--seed`: Random seed for instance generation
+- `--list`: List all available problems and exit
+
+**Conditional Arguments:**
+- `--conditional`: Enable conditional GFlowNet mode
+- `--num-instances`: Number of random instances to generate (default: 10)
+- `--min-cities`: Minimum cities per instance (default: 10)
+- `--max-cities`: Maximum cities per instance (default: 30)
+- `--num-layers`: Number of attention layers in policy (default: 3)
+- `--resume`: Resume from checkpoint (path or 'latest')
+
+Training logs are saved to `problems/tsp/logs/` in JSON Lines format.
+
+#### Checkpoints
+
+The training saves three types of checkpoints:
+- **Periodic**: `{name}_step_{N}.pt` - Saved every `--save-every` steps
+- **Best**: `{name}_best.pt` - Saved when average gap improves
+- **Final**: `{name}_final.pt` - Saved at end of training
+
+#### Evaluation
+
+Evaluate trained models on TSP problems:
+
+```bash
+# Single-instance evaluation
+python problems/tsp/evaluate.py --list                                    # List available problems
+python problems/tsp/evaluate.py --problem p_all --samples 100
+python problems/tsp/evaluate.py --random --num-cities 20 --checkpoint path/to/checkpoint.pt
+
+# Conditional evaluation (evaluate on random instances)
+python problems/tsp/evaluate.py --conditional --checkpoint checkpoints/conditional_best.pt --num-instances 10
+```
+
+**Single-Instance Evaluation Arguments:**
+- `--problem`: Problem name to evaluate
+- `--random`: Evaluate on a random instance
+- `--num-cities`: Number of cities for random instance
+- `--checkpoint`: Path to checkpoint (default: latest in checkpoints/)
+- `--samples`: Number of stochastic samples (default: 100)
+- `--hidden-dim`: Hidden dimension (must match training, default: 128)
+
+**Conditional Evaluation Arguments:**
+- `--conditional`: Enable conditional evaluation mode
+- `--checkpoint`: Path to conditional checkpoint
+- `--num-instances`: Number of random instances to evaluate (default: 10)
+- `--min-cities`, `--max-cities`: City range for random instances
+- `--samples`: Number of stochastic samples (default: 100)
+
+**Output:** Evaluation outputs the best solution found from stochastic sampling, including:
+- Tour length (and gap to optimal if known)
+- Tour order (sequence of cities)
 
 ## Available Datasets
 
@@ -229,6 +423,13 @@ python problems/knapsack/evaluate.py --problem p01 --checkpoint path/to/checkpoi
 | p07 | 15 | 750 | 1458 |
 | p08 | 24 | 6404180 | 13549094 |
 
+### TSP (Traveling Salesman Problem)
+| Problem | Cities | Description |
+|---------|--------|-------------|
+| p_all (uy734) | 734 | 734 locations in Uruguay |
+
+*Note: TSP also supports randomly generated instances with `--random --num-cities N`*
+
 ## Method
 
 This project uses **Generative Flow Networks (GFlowNets)** to learn policies that sample diverse, high-quality solutions to combinatorial optimization problems.
@@ -252,7 +453,10 @@ Three loss functions are available:
 Checkpoints are saved with problem-specific names:
 - **Graph Coloring (Single)**: `{graph}_K{colors}_step_{step}.pt` (e.g., `myciel3_K11_step_1000.pt`)
 - **Graph Coloring (Conditional)**: `conditional_K{colors}_{type}.pt` where type is `step_N`, `best`, or `final`
-- **Knapsack**: `{problem}_step_{step}.pt` (e.g., `p01_step_1000.pt`)
+- **Knapsack (Single)**: `{problem}_step_{step}.pt` (e.g., `p01_step_1000.pt`)
+- **Knapsack (Conditional)**: `conditional_{problems}_{type}.pt` (e.g., `conditional_p01-p02-p03_best.pt`)
+- **TSP (Single)**: `{problem}_step_{step}.pt` or `random_{N}_step_{step}.pt`
+- **TSP (Conditional)**: `conditional_{N}inst_{min}-{max}cities_{type}.pt`
 
 The evaluation scripts automatically find the latest checkpoint for each problem.
 
@@ -260,7 +464,7 @@ The evaluation scripts automatically find the latest checkpoint for each problem
 
 To add a new combinatorial optimization problem:
 
-1. Create a new folder under `problems/` (e.g., `problems/tsp/`)
+1. Create a new folder under `problems/` (e.g., `problems/new_problem/`)
 2. Implement the required files:
    - `env.py` - Environment class inheriting from `BaseEnv`
    - `policy.py` - Neural network policy

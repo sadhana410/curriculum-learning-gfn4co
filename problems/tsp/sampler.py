@@ -1,4 +1,4 @@
-# problems/knapsack/sampler.py
+# problems/tsp/sampler.py
 
 import torch
 import numpy as np
@@ -38,50 +38,33 @@ def sample_trajectory(env, forward_policy, device, epsilon=0.1):
     return traj_states, traj_actions, reward
 
 
-def get_batched_mask_knapsack(states, env, device):
+def get_batched_mask_tsp(states, env, device):
     """
     Compute allowed actions mask for a batch of states.
-    states: (B, N) numpy array or tensor
-    Returns: (B, 2*N) boolean tensor
+    
+    Args:
+        states: (B, N) numpy array or tensor
+        env: TSPEnv
+        device: torch device
+        
+    Returns:
+        mask: (B, N) boolean tensor
     """
     if isinstance(states, np.ndarray):
         states_t = torch.from_numpy(states).to(device=device, dtype=torch.long)
     else:
         states_t = states.to(dtype=torch.long)
-        
+    
     B, N = states_t.shape
     
-    # Ensure instance data is on device
-    if not hasattr(env, '_weights_t') or env._weights_t.device != device:
-        env._weights_t = torch.from_numpy(env.weights).to(device=device, dtype=torch.float32)
-        
-    # 1. Identify undecided items: (B, N)
-    undecided = (states_t == -1)
-    
-    # 2. Calculate remaining capacity
-    # selected items are 1
-    selected_mask = (states_t == 1).float()
-    current_weight = (selected_mask * env._weights_t.unsqueeze(0)).sum(dim=1) # (B,)
-    remaining = env.capacity - current_weight # (B,)
-    
-    # 3. Check fits
-    # weight[i] <= remaining[b]
-    fits = (env._weights_t.unsqueeze(0) <= remaining.unsqueeze(1)) # (B, N)
-    
-    # 4. Build masks
-    # Select (0..N-1): Allowed if undecided AND fits
-    mask_select = undecided & fits
-    
-    # Skip (N..2N-1): Allowed if undecided
-    mask_skip = undecided
-    
-    # Combine
-    mask = torch.cat([mask_select, mask_skip], dim=1) # (B, 2*N)
+    # Unvisited cities are valid actions
+    mask = (states_t == -1)
     
     return mask
 
 
-def sample_trajectories_batched(env, forward_policy, device, batch_size, epsilon=0.1, temperature=1.0, top_p=1.0):
+def sample_trajectories_batched(env, forward_policy, device, batch_size, 
+                                 epsilon=0.1, temperature=1.0, top_p=1.0):
     """
     Sample multiple trajectories in parallel using batched processing.
     """
@@ -105,22 +88,15 @@ def sample_trajectories_batched(env, forward_policy, device, batch_size, epsilon
         active_states = states[active_indices]
         A = len(active_indices)
         
-        # Get logits and masks for all active trajectories
         with torch.no_grad():
-            # Convert to tensor
             active_states_t = torch.from_numpy(active_states).to(device=device, dtype=torch.long)
-            
-            # Batched policy
             logits_batch = forward_policy(active_states_t, device=device)
-            
-            # Batched mask
-            masks_batch = get_batched_mask_knapsack(active_states, env, device)
+            masks_batch = get_batched_mask_tsp(active_states, env, device)
         
-        # Check for stuck states
+        # Check for stuck states (no valid actions)
         valid_counts = masks_batch.sum(dim=1)
-        
-        # Identify stuck
         stuck_rel = (valid_counts == 0).cpu().numpy()
+        
         if stuck_rel.any():
             stuck_indices = active_indices[stuck_rel]
             for idx in stuck_indices:
@@ -147,13 +123,10 @@ def sample_trajectories_batched(env, forward_policy, device, batch_size, epsilon
             sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=1)
             cumulative_probs = torch.cumsum(sorted_probs, dim=1)
             
-            # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
-            # Shift the indices to the right to keep also the first token above the threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
             
-            # Scatter sorted indices to original indices
             indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
             probs[indices_to_remove] = 0.0
             probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
@@ -187,11 +160,10 @@ def sample_trajectories_batched(env, forward_policy, device, batch_size, epsilon
                 trajectories[idx]['reward'] = float(rewards[i])
                 active_mask[idx] = False
     
-    # Convert to list of tuples
     results = [(t['states'], t['actions'], t['reward']) for t in trajectories]
     return results
-    
-    
+
+
 def collate_trajectories(trajectories, env, device):
     """
     Collate a list of trajectories into padded tensors.
@@ -225,31 +197,14 @@ def collate_trajectories(trajectories, env, device):
 # Conditional Sampling Functions
 # ============================================================================
 
-def sample_trajectory_conditional(env, forward_policy, device, instance_idx=None, 
+def sample_trajectory_conditional(env, forward_policy, device, instance_idx=None,
                                    epsilon=0.1, temperature=1.0, top_p=1.0):
     """
     Sample a single trajectory for conditional GFlowNet.
-    
-    Args:
-        env: ConditionalKnapsackEnv
-        forward_policy: ConditionalKnapsackPolicy
-        device: torch device
-        instance_idx: Index of instance to use (None = random)
-        epsilon: Exploration rate
-        temperature: Sampling temperature
-        top_p: Nucleus sampling threshold
-        
-    Returns:
-        states_list: List of states
-        actions_list: List of actions
-        reward: Final reward
-        instance_idx: Index of instance used
-        instance: Instance dict
     """
     state, instance_idx, instance = env.reset(instance_idx)
-    profits = instance['profits']
-    weights = instance['weights']
-    capacity = instance['capacity']
+    coords = instance['coords']
+    distance_matrix = instance['distance_matrix']
     
     traj_states = [state.copy()]
     traj_actions = []
@@ -257,8 +212,8 @@ def sample_trajectory_conditional(env, forward_policy, device, instance_idx=None
     done = False
     while not done:
         with torch.no_grad():
-            logits = forward_policy(state, profits, weights, capacity, device=device)
-            mask = torch.tensor(env.allowed_actions(state, instance_idx), 
+            logits = forward_policy(state, coords, distance_matrix, device=device)
+            mask = torch.tensor(env.allowed_actions(state, instance_idx),
                               dtype=torch.float32, device=device)
         
         if mask.sum() == 0:
@@ -266,7 +221,6 @@ def sample_trajectory_conditional(env, forward_policy, device, instance_idx=None
             reward = env.reward(state, instance_idx)
             break
         
-        # Epsilon-greedy exploration
         if torch.rand(1).item() < epsilon:
             valid_actions = torch.where(mask > 0)[0]
             action = valid_actions[torch.randint(len(valid_actions), (1,))].item()
@@ -275,7 +229,6 @@ def sample_trajectory_conditional(env, forward_policy, device, instance_idx=None
             masked_logits[mask == 0] = float('-inf')
             probs = torch.softmax(masked_logits / temperature, dim=0)
             
-            # Top-P sampling
             if top_p < 1.0:
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=0)
@@ -300,16 +253,12 @@ def sample_trajectories_conditional(env, forward_policy, device, batch_size,
                                     epsilon=0.1, temperature=1.0, top_p=1.0):
     """
     Sample multiple trajectories sequentially for conditional GFlowNet.
-    Each trajectory may use a different instance.
-    
-    Returns:
-        List of (states_list, actions_list, reward, instance_idx, instance)
     """
     trajectories = []
     for _ in range(batch_size):
         traj = sample_trajectory_conditional(
             env, forward_policy, device,
-            instance_idx=None,  # Random instance
+            instance_idx=None,
             epsilon=epsilon, temperature=temperature, top_p=top_p
         )
         trajectories.append(traj)
@@ -321,36 +270,19 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
                                             same_instance=True):
     """
     Sample multiple trajectories in parallel for conditional GFlowNet.
-    
-    Args:
-        env: ConditionalKnapsackEnv
-        forward_policy: ConditionalKnapsackPolicy
-        device: torch device
-        batch_size: Number of trajectories
-        epsilon: Exploration rate
-        temperature: Sampling temperature
-        top_p: Nucleus sampling threshold
-        same_instance: If True, all trajectories use the same instance
-        
-    Returns:
-        List of (states_list, actions_list, reward, instance_idx, instance)
     """
     if same_instance:
-        # Sample one instance for all trajectories
         instance_idx = np.random.randint(env.num_instances)
         instance = env.get_instance(instance_idx)
-        profits = instance['profits']
-        weights = instance['weights']
-        capacity = instance['capacity']
-        N = len(profits)
+        coords = instance['coords']
+        distance_matrix = instance['distance_matrix']
+        N = instance['N']
         
-        # Handle epsilon
         if isinstance(epsilon, float):
             epsilon_t = torch.full((batch_size,), epsilon, device=device)
         else:
             epsilon_t = epsilon
         
-        # Initialize batch of states
         states = np.stack([env.envs[instance_idx].reset() for _ in range(batch_size)])
         trajectories = [{'states': [s.copy()], 'actions': [], 'reward': 0.0, 'done': False}
                        for s in states]
@@ -364,12 +296,9 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
             
             with torch.no_grad():
                 active_states_t = torch.from_numpy(active_states).to(device=device, dtype=torch.long)
-                logits_batch = forward_policy(active_states_t, profits, weights, capacity, device=device)
-                masks_batch = get_batched_mask_knapsack_conditional(
-                    active_states, profits, weights, capacity, device
-                )
+                logits_batch = forward_policy(active_states_t, coords, distance_matrix, device=device)
+                masks_batch = get_batched_mask_tsp_conditional(active_states, device)
             
-            # Check for stuck states
             valid_counts = masks_batch.sum(dim=1)
             stuck_rel = (valid_counts == 0).cpu().numpy()
             
@@ -390,11 +319,9 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
                 masks_batch = masks_batch[torch.from_numpy(keep_rel).to(device)]
                 A = len(active_indices)
             
-            # Sampling
             logits_batch[~masks_batch] = float('-inf')
             probs = torch.softmax(logits_batch / temperature, dim=1)
             
-            # Top-P sampling
             if top_p < 1.0:
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=1)
@@ -407,13 +334,11 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
             
             policy_actions = torch.multinomial(probs, 1).squeeze(-1)
             
-            # Uniform random actions
             uniform_logits = torch.zeros_like(logits_batch)
             uniform_logits[~masks_batch] = float('-inf')
             uniform_probs = torch.softmax(uniform_logits, dim=1)
             random_actions = torch.multinomial(uniform_probs, 1).squeeze(-1)
             
-            # Choose based on epsilon
             active_eps = epsilon_t[active_indices]
             rand_draw = torch.rand(A, device=device)
             explore_mask = (rand_draw < active_eps)
@@ -421,7 +346,6 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
             final_actions = torch.where(explore_mask, random_actions, policy_actions)
             actions_np = final_actions.cpu().numpy()
             
-            # Take step
             for i, idx in enumerate(active_indices):
                 action = int(actions_np[i])
                 next_state, reward, done = env.step(states[idx], action, instance_idx)
@@ -435,86 +359,42 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
                     trajectories[idx]['reward'] = float(reward)
                     active_mask[idx] = False
         
-        # Convert to list of tuples
-        results = [(t['states'], t['actions'], t['reward'], instance_idx, instance) 
+        results = [(t['states'], t['actions'], t['reward'], instance_idx, instance)
                    for t in trajectories]
         return results
     else:
-        # Different instances - fall back to sequential
         return sample_trajectories_conditional(
             env, forward_policy, device, batch_size,
             epsilon=epsilon, temperature=temperature, top_p=top_p
         )
 
 
-def get_batched_mask_knapsack_conditional(states, profits, weights, capacity, device):
+def get_batched_mask_tsp_conditional(states, device):
     """
-    Compute allowed actions mask for a batch of states with instance data.
-    
-    Args:
-        states: (B, N) numpy array or tensor
-        profits: (N,) numpy array
-        weights: (N,) numpy array
-        capacity: scalar
-        device: torch device
-        
-    Returns:
-        mask: (B, 2*N) boolean tensor
+    Compute allowed actions mask for a batch of states.
     """
     if isinstance(states, np.ndarray):
         states_t = torch.from_numpy(states).to(device=device, dtype=torch.long)
     else:
         states_t = states.to(dtype=torch.long)
     
-    if isinstance(weights, np.ndarray):
-        weights_t = torch.from_numpy(weights).to(device=device, dtype=torch.float32)
-    else:
-        weights_t = weights.to(device).float()
-    
-    B, N = states_t.shape
-    
-    # Undecided items
-    undecided = (states_t == -1)
-    
-    # Calculate remaining capacity
-    selected_mask = (states_t == 1).float()
-    current_weight = (selected_mask * weights_t.unsqueeze(0)).sum(dim=1)
-    remaining = capacity - current_weight
-    
-    # Check fits
-    fits = (weights_t.unsqueeze(0) <= remaining.unsqueeze(1))
-    
-    # Build masks
-    mask_select = undecided & fits
-    mask_skip = undecided
-    
-    mask = torch.cat([mask_select, mask_skip], dim=1)
-    
+    mask = (states_t == -1)
     return mask
 
 
 def collate_trajectories_conditional(trajectories, device):
     """
     Collate conditional trajectories grouped by instance size.
-    
-    Args:
-        trajectories: List of (states_list, actions_list, reward, instance_idx, instance)
-        device: torch device
-        
-    Returns:
-        Dict mapping N -> {states, actions, step_mask, rewards, profits, weights, capacity, instance_indices}
     """
-    # Group by instance size
     by_size = {}
     for traj in trajectories:
         states_list, actions_list, reward, instance_idx, instance = traj
-        N = len(instance['profits'])
+        N = instance['N']
         
         if N not in by_size:
             by_size[N] = []
         by_size[N].append(traj)
     
-    # Collate each group
     collated = {}
     for N, group in by_size.items():
         B = len(group)
@@ -527,11 +407,9 @@ def collate_trajectories_conditional(trajectories, device):
         rewards = torch.zeros(B, dtype=torch.float32, device=device)
         instance_indices = []
         
-        # Get instance data from first trajectory (all same size)
         first_instance = group[0][4]
-        profits = torch.tensor(first_instance['profits'], dtype=torch.float32, device=device)
-        weights = torch.tensor(first_instance['weights'], dtype=torch.float32, device=device)
-        capacity = first_instance['capacity']
+        coords = torch.tensor(first_instance['coords'], dtype=torch.float32, device=device)
+        distance_matrix = torch.tensor(first_instance['distance_matrix'], dtype=torch.float32, device=device)
         
         for b, (states_list, actions_list, reward, instance_idx, instance) in enumerate(group):
             L = len(actions_list)
@@ -550,11 +428,9 @@ def collate_trajectories_conditional(trajectories, device):
             'actions': actions,
             'step_mask': step_mask,
             'rewards': rewards,
-            'profits': profits,
-            'weights': weights,
-            'capacity': capacity,
+            'coords': coords,
+            'distance_matrix': distance_matrix,
             'instance_indices': instance_indices,
         }
     
     return collated
-

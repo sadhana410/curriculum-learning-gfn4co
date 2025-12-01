@@ -639,6 +639,10 @@ def evaluate_conditional(checkpoint_path, graphs, device, num_samples=100):
         if stoch_colored < N:
             stoch_info += f", {stoch_colored}/{N} colored"
         print(f"  Stochastic: {stoch_info} {stoch_status}")
+        
+        # Store states for output
+        results[graph_file]['greedy']['state'] = greedy_state.tolist()
+        results[graph_file]['stochastic']['state'] = stoch_state.tolist()
     
     return results
 
@@ -703,6 +707,30 @@ def main_conditional_eval(args):
     
     print(f"Valid colorings: {total_valid}/{len(results)}")
     print(f"Optimal colorings: {total_optimal}/{len(results)}")
+    
+    # Print best solutions
+    print("\n" + "=" * 60)
+    print("BEST SOLUTIONS (Stochastic)")
+    print("=" * 60)
+    for graph_file, r in results.items():
+        print(f"\n{graph_file}:")
+        state = r['stochastic']['state']
+        colors_used = r['stochastic']['colors']
+        conflicts = r['stochastic']['conflicts']
+        is_valid = r['stochastic']['is_valid']
+        is_optimal = r['stochastic']['is_optimal']
+        
+        status = "OPTIMAL" if is_optimal else ("VALID" if is_valid else "INVALID")
+        print(f"  Status: {status}")
+        print(f"  Colors used: {colors_used}, Conflicts: {conflicts}")
+        print(f"  Coloring: {state}")
+        
+        # Show color distribution
+        color_counts = {}
+        for c in state:
+            if c != -1:
+                color_counts[c] = color_counts.get(c, 0) + 1
+        print(f"  Distribution: {dict(sorted(color_counts.items()))}")
     
     # Save results
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -864,6 +892,23 @@ def main_single_instance_eval(args):
                 color_counts[c] = color_counts.get(c, 0) + 1
         for c in sorted(color_counts.keys()):
             print(f"  Color {c}: {color_counts[c]} nodes")
+        
+        # Output best solution
+        print(f"\n" + "=" * 60)
+        print("BEST SOLUTION")
+        print("=" * 60)
+        best_state = results['stochastic_state']
+        best_conflicts = results['stochastic_conflicts']
+        best_colors = results['stochastic_colors']
+        best_colored = results['stochastic_colored']
+        
+        is_valid = best_conflicts == 0 and best_colored == results['nodes']
+        is_optimal = is_valid and best_colors <= chromatic
+        
+        status = "OPTIMAL" if is_optimal else ("VALID" if is_valid else "INVALID")
+        print(f"Status: {status}")
+        print(f"Colors used: {best_colors}, Conflicts: {best_conflicts}")
+        print(f"Coloring: {best_state.tolist()}")
             
     except Exception as e:
         print(f"Error: {e}")

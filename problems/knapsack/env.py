@@ -199,3 +199,169 @@ class KnapsackEnv(BaseEnv):
         """Get total weight of current selection."""
         selected = state == 1
         return np.sum(self.weights[selected])
+
+
+class KnapsackInstanceDataset:
+    """
+    Dataset of knapsack instances for conditional training.
+    Loads instances from a data directory.
+    """
+    
+    def __init__(self, data_dir, instance_names=None):
+        """
+        Args:
+            data_dir: Directory containing instance folders
+            instance_names: List of instance names to load. If None, loads all.
+        """
+        from problems.knapsack.utils import load_knapsack_instance, list_knapsack_instances
+        
+        self.data_dir = data_dir
+        
+        if instance_names is None:
+            instance_names = list_knapsack_instances(data_dir)
+        
+        self.instances = []
+        for name in instance_names:
+            try:
+                inst = load_knapsack_instance(data_dir, name)
+                self.instances.append(inst)
+            except Exception as e:
+                print(f"Warning: Failed to load instance {name}: {e}")
+        
+        if not self.instances:
+            raise ValueError(f"No valid instances found in {data_dir}")
+        
+        print(f"Loaded {len(self.instances)} knapsack instances")
+    
+    def __len__(self):
+        return len(self.instances)
+    
+    def __getitem__(self, idx):
+        return self.instances[idx]
+    
+    def sample(self):
+        """Sample a random instance."""
+        idx = np.random.randint(len(self.instances))
+        return idx, self.instances[idx]
+
+
+class ConditionalKnapsackEnv:
+    """
+    Conditional Knapsack environment that can handle multiple instances.
+    
+    This environment wraps multiple knapsack instances and provides methods
+    to sample and interact with them for conditional GFlowNet training.
+    """
+    
+    def __init__(self, instances, alpha=0.1, beta=0.01, gamma=1.0):
+        """
+        Args:
+            instances: List of instance dicts or KnapsackInstanceDataset
+            alpha: Reward coefficient for profit
+            beta: Reward coefficient for slack penalty
+            gamma: Reward coefficient for overflow penalty
+        """
+        if isinstance(instances, KnapsackInstanceDataset):
+            self.instances = instances.instances
+        else:
+            self.instances = instances
+        
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        
+        self.num_instances = len(self.instances)
+        
+        # Create individual environments for each instance
+        self.envs = []
+        for inst in self.instances:
+            env = KnapsackEnv(inst, alpha=alpha, beta=beta, gamma=gamma)
+            self.envs.append(env)
+        
+        # Current instance index
+        self._current_idx = 0
+    
+    def get_instance(self, idx):
+        """Get instance by index."""
+        return self.instances[idx]
+    
+    def get_env(self, idx):
+        """Get environment for instance by index."""
+        return self.envs[idx]
+    
+    def sample_instance(self):
+        """Sample a random instance, returns (idx, instance)."""
+        idx = np.random.randint(self.num_instances)
+        return idx, self.instances[idx]
+    
+    def reset(self, instance_idx=None):
+        """
+        Reset environment for a specific instance.
+        
+        Args:
+            instance_idx: Index of instance to use. If None, samples randomly.
+            
+        Returns:
+            state: Initial state
+            instance_idx: Index of the instance being used
+            instance: The instance dict
+        """
+        if instance_idx is None:
+            instance_idx = np.random.randint(self.num_instances)
+        
+        self._current_idx = instance_idx
+        state = self.envs[instance_idx].reset()
+        
+        return state, instance_idx, self.instances[instance_idx]
+    
+    def step(self, state, action, instance_idx=None):
+        """
+        Take a step in the environment.
+        
+        Args:
+            state: Current state
+            action: Action to take
+            instance_idx: Instance index (uses current if None)
+            
+        Returns:
+            next_state, reward, done
+        """
+        if instance_idx is None:
+            instance_idx = self._current_idx
+        
+        return self.envs[instance_idx].step(state, action)
+    
+    def allowed_actions(self, state, instance_idx=None):
+        """Get allowed actions mask for state."""
+        if instance_idx is None:
+            instance_idx = self._current_idx
+        
+        return self.envs[instance_idx].allowed_actions(state)
+    
+    def is_terminal(self, state, instance_idx=None):
+        """Check if state is terminal."""
+        if instance_idx is None:
+            instance_idx = self._current_idx
+        
+        return self.envs[instance_idx].is_terminal(state)
+    
+    def reward(self, state, instance_idx=None):
+        """Compute reward for terminal state."""
+        if instance_idx is None:
+            instance_idx = self._current_idx
+        
+        return self.envs[instance_idx].reward(state)
+    
+    def get_profit(self, state, instance_idx=None):
+        """Get total profit of current selection."""
+        if instance_idx is None:
+            instance_idx = self._current_idx
+        
+        return self.envs[instance_idx].get_profit(state)
+    
+    def get_weight(self, state, instance_idx=None):
+        """Get total weight of current selection."""
+        if instance_idx is None:
+            instance_idx = self._current_idx
+        
+        return self.envs[instance_idx].get_weight(state)

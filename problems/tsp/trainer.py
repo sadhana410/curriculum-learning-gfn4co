@@ -1,4 +1,4 @@
-# problems/knapsack/trainer.py
+# problems/tsp/trainer.py
 
 import os
 import json
@@ -8,14 +8,13 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-from problems.knapsack.sampler import (
-    sample_trajectories_batched, collate_trajectories, get_batched_mask_knapsack,
+from problems.tsp.sampler import (
+    sample_trajectories_batched, collate_trajectories, get_batched_mask_tsp,
     sample_trajectories_conditional, sample_trajectories_conditional_batched,
-    collate_trajectories_conditional, get_batched_mask_knapsack_conditional
+    collate_trajectories_conditional, get_batched_mask_tsp_conditional
 )
 
 
-# Pre-allocate tensors for speed
 _inf_tensor = None
 
 def get_inf_tensor(device):
@@ -25,20 +24,32 @@ def get_inf_tensor(device):
     return _inf_tensor
 
 
-def build_backward_masks_knapsack(states, N, device):
+def build_backward_masks_tsp(states, N, device):
     """
-    Compute backward allowed actions mask.
-    states: (B, N)
-    Returns: (B, 2*N) boolean tensor
+    Compute backward allowed actions mask for TSP.
+    
+    In TSP, backward action undoes the last city visit.
+    Only the last visited city (highest position value) can be unvisited.
+    
+    Args:
+        states: (B, N) tensor
+        
+    Returns:
+        mask: (B, N) boolean tensor
     """
     B = states.shape[0]
-    mask = torch.zeros(B, 2*N, dtype=torch.bool, device=device)
+    mask = torch.zeros(B, N, dtype=torch.bool, device=device)
     
-    # Selected items (1) allow undo select (action 0..N-1)
-    mask[:, :N] = (states == 1)
+    # Find the last visited city (highest position value)
+    # Exclude city 0 which is always the start
+    states_masked = states.clone()
+    states_masked[:, 0] = -2  # Don't allow unvisiting city 0
     
-    # Skipped items (0) allow undo skip (action N..2N-1)
-    mask[:, N:] = (states == 0)
+    max_pos = states_masked.max(dim=1, keepdim=True)[0]  # (B, 1)
+    
+    # Only the city with max position can be unvisited (if > 0)
+    is_last = (states == max_pos) & (max_pos > 0)
+    mask = is_last
     
     return mask
 
@@ -46,37 +57,31 @@ def build_backward_masks_knapsack(states, N, device):
 def compute_logprobs_batched(states, actions, step_mask,
                              forward_policy, backward_policy, env, device):
     """
-    states:    (T_max+1, B, N) long
-    actions:   (T_max,   B)    long
-    step_mask: (T_max,   B)    bool
-    Returns:
-      logprob_f: (B,)
-      logprob_b: (B,)
+    Compute log probabilities for TSP trajectories.
     """
     T_max, B, N = states.shape[0] - 1, states.shape[1], states.shape[2]
-    
     T_B = T_max * B
     
     states_before = states[:-1].reshape(T_B, N)
-    states_after  = states[1:].reshape(T_B, N)
-    flat_actions  = actions.reshape(T_B)
-    flat_mask     = step_mask.reshape(T_B)
+    states_after = states[1:].reshape(T_B, N)
+    flat_actions = actions.reshape(T_B)
+    flat_mask = step_mask.reshape(T_B)
     
     valid_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
     if valid_idx.numel() == 0:
         return torch.zeros(B, device=device), torch.zeros(B, device=device)
-        
+    
     states_before_valid = states_before[valid_idx]
-    states_after_valid  = states_after[valid_idx]
-    actions_valid       = flat_actions[valid_idx]
+    states_after_valid = states_after[valid_idx]
+    actions_valid = flat_actions[valid_idx]
     
     # Batched policy calls
     logits_f = forward_policy(states_before_valid, device=device)
     logits_b = backward_policy(states_after_valid, device=device)
     
     # Masks
-    mask_f = get_batched_mask_knapsack(states_before_valid, env, device).bool()
-    mask_b = build_backward_masks_knapsack(states_after_valid, N, device)
+    mask_f = get_batched_mask_tsp(states_before_valid, env, device).bool()
+    mask_b = build_backward_masks_tsp(states_after_valid, N, device)
     
     inf_val = get_inf_tensor(device)
     logits_f = torch.where(mask_f, logits_f, inf_val)
@@ -101,11 +106,9 @@ def compute_logprobs_batched(states, actions, step_mask,
     step_logp_f_flat[valid_idx] = step_logp_f_valid
     step_logp_b_flat[valid_idx] = step_logp_b_valid
     
-    # Reshape to (T, B)
     step_logp_f = step_logp_f_flat.view(T_max, B)
     step_logp_b = step_logp_b_flat.view(T_max, B)
     
-    # Mask invalid steps
     step_logp_f = step_logp_f * step_mask
     step_logp_b = step_logp_b * step_mask
     
@@ -115,9 +118,9 @@ def compute_logprobs_batched(states, actions, step_mask,
 def train(env, forward_policy, backward_policy, loss_fn, optimizer,
           steps=2000, device="cpu", save_dir=None, problem_name=None,
           batch_size=16, epsilon_start=0.5, log_dir=None, save_every=500,
-          early_stop_patience=500, optimal_profit=None, top_p=1.0, temperature=1.0):
+          early_stop_patience=500, optimal_length=None, top_p=1.0, temperature=1.0):
     """
-    Training loop for knapsack GFN with batch training.
+    Training loop for TSP GFlowNet.
     """
     if save_dir is None:
         save_dir = os.path.join(os.path.dirname(__file__), "checkpoints")
@@ -127,7 +130,6 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     
-    # Setup logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_name = f"{problem_name}_{timestamp}" if problem_name else f"train_{timestamp}"
     log_path = os.path.join(log_dir, f"{log_name}.jsonl")
@@ -140,9 +142,8 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
         "epsilon_start": epsilon_start,
         "top_p": top_p,
         "temperature": temperature,
-        "num_items": env.N,
-        "capacity": env.capacity,
-        "optimal_profit": optimal_profit,
+        "num_cities": env.N,
+        "optimal_length": float(optimal_length) if optimal_length is not None else None,
         "device": str(device),
         "timestamp": timestamp,
     }
@@ -153,44 +154,40 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
     start_time = time.time()
     
     reward_history = []
-    profit_history = []
+    length_history = []
     loss_history = []
-    best_profit = 0.0
+    best_length = float('inf')
     best_reward = float('-inf')
     best_state = None
     
-    # Early stopping tracking
     steps_without_improvement = 0
-    prev_best_profit = 0.0
+    prev_best_length = float('inf')
     
     for step in range(steps):
         epsilon = max(0.01, epsilon_start * (1 - step / steps))
         
-        # Sample batch of trajectories in parallel
         batch_trajectories = sample_trajectories_batched(
-            env, forward_policy, device, batch_size, 
+            env, forward_policy, device, batch_size,
             epsilon=epsilon, temperature=temperature, top_p=top_p
         )
         
         batch_rewards = []
-        batch_profits = []
+        batch_lengths = []
         
         for traj_states, traj_actions, reward in batch_trajectories:
             final_state = traj_states[-1]
-            profit = env.get_profit(final_state)
-            weight = env.get_weight(final_state)
+            length = env.get_tour_length(final_state)
             
             batch_rewards.append(reward)
-            batch_profits.append(profit)
+            batch_lengths.append(length)
             
             if reward > best_reward:
                 best_reward = reward
-
-            if profit > best_profit and weight <= env.capacity:
-                best_profit = profit
+            
+            if length < best_length:
+                best_length = length
                 best_state = final_state.copy()
         
-        # Collate and compute losses
         states, actions, step_mask, rewards_tensor = collate_trajectories(
             batch_trajectories, env, device
         )
@@ -208,47 +205,41 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
             loss_type = "SubTB"
         elif loss_fn.__class__.__name__ == "DetailedBalance":
             loss_type = "DB"
-            
+        
         if loss_type == "TB":
             log_pf_sum = (logprobs_f_batch * step_mask).sum(dim=0)
             log_pb_sum = (logprobs_b_batch * step_mask).sum(dim=0)
             traj_losses = loss_fn(log_pf_sum, log_pb_sum, logreward_batch)
             cumulative_loss = traj_losses.mean()
         else:
-            # DB or SubTB
             T_plus_1, B, N = states.shape
             flat_states = states.reshape(-1, N)
-            
-            # Predict flows
             flat_log_flows = forward_policy.predict_flow(flat_states, device)
             log_flows = flat_log_flows.view(T_plus_1, B)
-            
             cumulative_loss = loss_fn(logprobs_f_batch, logprobs_b_batch, log_flows, logreward_batch, step_mask)
         
         reward_history.extend(batch_rewards)
-        profit_history.extend(batch_profits)
+        length_history.extend(batch_lengths)
         loss_history.append(cumulative_loss.item())
         
         optimizer.zero_grad()
         cumulative_loss.backward()
         
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(forward_policy.parameters(), max_norm=0.5)
         if hasattr(forward_policy, 'flow_head'):
-             torch.nn.utils.clip_grad_norm_(forward_policy.flow_head.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(forward_policy.flow_head.parameters(), max_norm=0.5)
         torch.nn.utils.clip_grad_norm_(backward_policy.parameters(), max_norm=0.5)
         if hasattr(loss_fn, 'logZ'):
             torch.nn.utils.clip_grad_norm_([loss_fn.logZ], max_norm=0.5)
         optimizer.step()
         
         if step % 50 == 0:
-            avg_profit = np.mean(profit_history[-50*batch_size:]) if len(profit_history) >= 50*batch_size else np.mean(profit_history)
+            avg_length = np.mean(length_history[-50*batch_size:]) if len(length_history) >= 50*batch_size else np.mean(length_history)
             avg_reward = np.mean(reward_history[-50*batch_size:]) if len(reward_history) >= 50*batch_size else np.mean(reward_history)
             avg_loss = np.mean(loss_history[-50:]) if len(loss_history) >= 50 else np.mean(loss_history)
-            batch_avg_profit = np.mean(batch_profits)
+            batch_avg_length = np.mean(batch_lengths)
             elapsed = time.time() - start_time
             
-            # Calculate ETA
             if step > 0:
                 steps_remaining = steps - step
                 time_per_step = elapsed / step
@@ -259,19 +250,20 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
             else:
                 eta_str = "--"
             
-            opt_str = f"/{optimal_profit:.0f}" if optimal_profit else ""
-            gap = ((optimal_profit - best_profit) / optimal_profit * 100) if optimal_profit and optimal_profit > 0 else 0
-            print(f"[{step}] loss={cumulative_loss.item():.4f}, log_reward={avg_reward:.2f}, profit={batch_avg_profit:.1f}, best={best_profit:.0f}{opt_str}, gap={gap:.1f}%, no_improv={steps_without_improvement}, eps={epsilon:.3f}, ETA={eta_str}", flush=True)
+            opt_str = f"/{optimal_length:.1f}" if optimal_length else ""
+            gap = ((best_length - optimal_length) / optimal_length * 100) if optimal_length and optimal_length > 0 else 0
+            gap_str = f"{max(0, gap):.1f}%"  # Avoid -0.0% display
+            print(f"[{step}] loss={cumulative_loss.item():.4f}, log_reward={avg_reward:.2f}, length={batch_avg_length:.1f}, best={best_length:.1f}{opt_str}, gap={gap_str}, no_improv={steps_without_improvement}, eps={epsilon:.3f}, ETA={eta_str}", flush=True)
             
-            # Log to file
             log_entry = {
                 "type": "step",
                 "step": step,
                 "loss": float(cumulative_loss.item()),
                 "avg_loss": float(avg_loss),
                 "avg_reward": float(avg_reward),
-                "best_profit": float(best_profit),
-                "optimal_profit": float(optimal_profit) if optimal_profit else None,
+                "avg_length": float(avg_length),
+                "best_length": float(best_length),
+                "optimal_length": float(optimal_length) if optimal_length else None,
                 "gap_percent": float(gap),
                 "steps_without_improvement": steps_without_improvement,
                 "epsilon": float(epsilon),
@@ -288,7 +280,7 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
                 'backward_policy': backward_policy.state_dict(),
                 'loss_fn': loss_fn.state_dict(),
                 'optimizer': optimizer.state_dict(),
-                'best_profit': best_profit,
+                'best_length': best_length,
                 'best_state': best_state,
                 'problem_name': problem_name,
             }
@@ -299,70 +291,56 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
             torch.save(checkpoint, os.path.join(save_dir, ckpt_name))
             print(f"  -> Saved checkpoint: {ckpt_name}", flush=True)
         
-        # Early stopping check
-        if best_profit > prev_best_profit:
-            prev_best_profit = best_profit
+        if best_length < prev_best_length:
+            prev_best_length = best_length
             steps_without_improvement = 0
         else:
             steps_without_improvement += 1
         
-        # Stop if optimal profit reached
-        if optimal_profit and best_profit >= optimal_profit:
-            print(f"\n✓ Optimal solution found! Profit: {best_profit:.0f} (optimal: {optimal_profit:.0f})")
-            print(f"  Stopping at step {step + 1}")
+        # Check if optimal solution found (within 0.01% tolerance)
+        if optimal_length and best_length <= optimal_length * 1.0001:
+            gap = max(0, (best_length - optimal_length) / optimal_length * 100)
+            print(f"\n✓ Optimal solution found at step {step}!")
+            print(f"  Best length: {best_length:.4f}, Optimal: {optimal_length:.4f}, Gap: {gap:.4f}%")
+            # Save final checkpoint
+            checkpoint = {
+                'step': step + 1,
+                'forward_policy': forward_policy.state_dict(),
+                'backward_policy': backward_policy.state_dict(),
+                'loss_fn': loss_fn.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'best_length': best_length,
+                'best_state': best_state,
+                'problem_name': problem_name,
+                'optimal_found': True,
+            }
+            ckpt_name = f'{problem_name}_optimal.pt' if problem_name else 'checkpoint_optimal.pt'
+            torch.save(checkpoint, os.path.join(save_dir, ckpt_name))
+            print(f"  -> Saved optimal checkpoint: {ckpt_name}")
             break
         
-        # Stop if no improvement for patience steps
         if early_stop_patience and steps_without_improvement >= early_stop_patience:
-            gap = ((optimal_profit - best_profit) / optimal_profit * 100) if optimal_profit else 0
+            gap = max(0, ((best_length - optimal_length) / optimal_length * 100)) if optimal_length else 0
             print(f"\n⚠ Early stopping: no improvement for {early_stop_patience} steps")
-            print(f"  Best profit: {best_profit:.0f}, Optimal: {optimal_profit}, Gap: {gap:.2f}%")
+            print(f"  Best length: {best_length:.1f}, Optimal: {optimal_length}, Gap: {gap:.2f}%")
             break
     
-    return best_state, best_profit
+    return best_state, best_length
 
 
 # ============================================================================
 # Conditional Training Functions
 # ============================================================================
 
-def build_backward_masks_knapsack_conditional(states, N, device):
-    """
-    Compute backward allowed actions mask for conditional knapsack.
-    states: (B, N)
-    Returns: (B, 2*N) boolean tensor
-    """
-    B = states.shape[0]
-    mask = torch.zeros(B, 2*N, dtype=torch.bool, device=device)
-    
-    # Selected items (1) allow undo select (action 0..N-1)
-    mask[:, :N] = (states == 1)
-    
-    # Skipped items (0) allow undo skip (action N..2N-1)
-    mask[:, N:] = (states == 0)
-    
-    return mask
+def build_backward_masks_tsp_conditional(states, N, device):
+    """Compute backward allowed actions mask for conditional TSP."""
+    return build_backward_masks_tsp(states, N, device)
 
 
-def compute_logprobs_conditional(states, actions, step_mask, profits, weights, capacity,
+def compute_logprobs_conditional(states, actions, step_mask, coords, distance_matrix,
                                   forward_policy, backward_policy, device):
     """
-    Compute log probabilities for conditional knapsack trajectories.
-    
-    Args:
-        states: (T_max+1, B, N) long tensor
-        actions: (T_max, B) long tensor
-        step_mask: (T_max, B) bool tensor
-        profits: (N,) tensor
-        weights: (N,) tensor
-        capacity: scalar
-        forward_policy: ConditionalKnapsackPolicy
-        backward_policy: ConditionalKnapsackPolicy
-        device: torch device
-        
-    Returns:
-        step_logp_f: (T_max, B) forward log probs
-        step_logp_b: (T_max, B) backward log probs
+    Compute log probabilities for conditional TSP trajectories.
     """
     T_max, B, N = states.shape[0] - 1, states.shape[1], states.shape[2]
     T_B = T_max * B
@@ -380,13 +358,11 @@ def compute_logprobs_conditional(states, actions, step_mask, profits, weights, c
     states_after_valid = states_after[valid_idx]
     actions_valid = flat_actions[valid_idx]
     
-    # Batched policy calls
-    logits_f = forward_policy(states_before_valid, profits, weights, capacity, device=device)
-    logits_b = backward_policy(states_after_valid, profits, weights, capacity, device=device)
+    logits_f = forward_policy(states_before_valid, coords, distance_matrix, device=device)
+    logits_b = backward_policy(states_after_valid, coords, distance_matrix, device=device)
     
-    # Masks
-    mask_f = get_batched_mask_knapsack_conditional(states_before_valid, profits, weights, capacity, device).bool()
-    mask_b = build_backward_masks_knapsack_conditional(states_after_valid, N, device)
+    mask_f = get_batched_mask_tsp_conditional(states_before_valid, device).bool()
+    mask_b = build_backward_masks_tsp_conditional(states_after_valid, N, device)
     
     inf_val = get_inf_tensor(device)
     logits_f = torch.where(mask_f, logits_f, inf_val)
@@ -404,18 +380,15 @@ def compute_logprobs_conditional(states, actions, step_mask, profits, weights, c
         actions_valid
     ]
     
-    # Scatter back
     step_logp_f_flat = torch.zeros(T_B, device=device)
     step_logp_b_flat = torch.zeros(T_B, device=device)
     
     step_logp_f_flat[valid_idx] = step_logp_f_valid
     step_logp_b_flat[valid_idx] = step_logp_b_valid
     
-    # Reshape to (T, B)
     step_logp_f = step_logp_f_flat.view(T_max, B)
     step_logp_b = step_logp_b_flat.view(T_max, B)
     
-    # Mask invalid steps
     step_logp_f = step_logp_f * step_mask
     step_logp_b = step_logp_b * step_mask
     
@@ -457,55 +430,29 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                       early_stop_patience=500, top_p=1.0, temperature=1.0,
                       same_instance_per_batch=True, resume_from=None):
     """
-    Train Conditional GFlowNet for knapsack on multiple instances.
-    
-    The policy learns to generalize across different knapsack instances.
-    
-    Args:
-        env: ConditionalKnapsackEnv with multiple instances
-        forward_policy: ConditionalKnapsackPolicy (or wrapper)
-        backward_policy: ConditionalKnapsackPolicy (or wrapper)
-        loss_fn: Loss function (TB, DB, or SubTB)
-        optimizer: Optimizer
-        steps: Number of training steps
-        device: torch device
-        save_dir: Directory to save checkpoints
-        problem_name: Name for logging
-        batch_size: Number of trajectories per step
-        epsilon_start: Initial exploration rate
-        log_dir: Directory for logs
-        save_every: Checkpoint frequency
-        early_stop_patience: Steps without improvement before stopping
-        top_p: Nucleus sampling threshold
-        temperature: Sampling temperature
-        same_instance_per_batch: If True, all trajectories in a batch use same instance
-        resume_from: Path to checkpoint to resume from (or 'latest')
+    Train Conditional GFlowNet for TSP on multiple instances.
     """
     reward_history = []
     loss_history = []
     best_reward = float('-inf')
     start_step = 0
     
-    # Track best profit per instance
     best_per_instance = {}
     for i in range(env.num_instances):
         inst = env.get_instance(i)
         best_per_instance[i] = {
-            'profit': 0.0,
+            'length': float('inf'),
             'state': None,
             'name': inst['name'],
-            'optimal': inst.get('optimal_profit', None)
+            'optimal': inst.get('optimal_length', None)
         }
     
-    # Early stopping
     steps_without_improvement = 0
     prev_best_avg_gap = float('inf')
     
-    # Create directories
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
     
-    # Handle resume from checkpoint
     if resume_from:
         checkpoint_path = None
         
@@ -534,7 +481,7 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 saved_best = checkpoint['best_per_instance']
                 for idx in best_per_instance:
                     if idx in saved_best:
-                        best_per_instance[idx]['profit'] = saved_best[idx].get('profit', 0.0)
+                        best_per_instance[idx]['length'] = saved_best[idx].get('length', float('inf'))
                         best_per_instance[idx]['state'] = saved_best[idx].get('state')
             
             print(f"  Resumed at step {start_step}")
@@ -544,7 +491,6 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             print(f"Warning: Checkpoint not found: {resume_from}")
             print("Starting from scratch...")
     
-    # Setup logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     if resume_from and start_step > 0:
         log_name = f"{problem_name}_resumed_{timestamp}" if problem_name else f"train_conditional_resumed_{timestamp}"
@@ -552,14 +498,12 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
         log_name = f"{problem_name}_{timestamp}" if problem_name else f"train_conditional_{timestamp}"
     log_path = os.path.join(log_dir, f"{log_name}.jsonl")
     
-    # Detect loss type
     loss_type = "TB"
     if hasattr(loss_fn, 'lambda_'):
         loss_type = "SubTB"
     elif loss_fn.__class__.__name__ == "DetailedBalance":
         loss_type = "DB"
     
-    # Log config
     config = {
         "type": "config",
         "mode": "conditional",
@@ -580,7 +524,7 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
     with open(log_path, "w") as f:
         f.write(json.dumps(config) + "\n")
     
-    print(f"Conditional GFlowNet Training (Knapsack)")
+    print(f"Conditional GFlowNet Training (TSP)")
     print(f"  Instances: {env.num_instances}")
     print(f"  Loss: {loss_type}")
     if start_step > 0:
@@ -594,7 +538,6 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
     for step in range(start_step, steps):
         epsilon = max(0.01, epsilon_start * (1 - step / steps))
         
-        # Sample trajectories
         if same_instance_per_batch:
             batch_trajectories = sample_trajectories_conditional_batched(
                 env, forward_policy, device, batch_size,
@@ -608,9 +551,8 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             )
         
         batch_rewards = []
-        batch_profits = []
+        batch_lengths = []
         
-        # Track best solutions
         for states_list, actions_list, reward, instance_idx, instance in batch_trajectories:
             batch_rewards.append(reward)
             
@@ -618,21 +560,15 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 best_reward = reward
             
             final_state = states_list[-1]
-            profit = env.get_profit(final_state, instance_idx)
-            weight = env.get_weight(final_state, instance_idx)
-            capacity = instance['capacity']
+            length = env.get_tour_length(final_state, instance_idx)
+            batch_lengths.append(length)
             
-            batch_profits.append(profit)
-            
-            # Valid solution check
-            if weight <= capacity and profit > best_per_instance[instance_idx]['profit']:
-                best_per_instance[instance_idx]['profit'] = profit
+            if length < best_per_instance[instance_idx]['length']:
+                best_per_instance[instance_idx]['length'] = length
                 best_per_instance[instance_idx]['state'] = final_state.copy()
         
-        # Collate trajectories (grouped by instance size)
         collated = collate_trajectories_conditional(batch_trajectories, device)
         
-        # Compute loss for each size group
         total_loss = torch.tensor(0.0, device=device)
         total_trajs = 0
         
@@ -641,14 +577,12 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             actions = data['actions']
             step_mask = data['step_mask']
             rewards_tensor = data['rewards']
-            profits = data['profits']
-            weights = data['weights']
-            capacity = data['capacity']
+            coords = data['coords']
+            distance_matrix = data['distance_matrix']
             B_group = states.shape[1]
             
-            # Compute log probabilities
             step_log_pf, step_log_pb = compute_logprobs_conditional(
-                states, actions, step_mask, profits, weights, capacity,
+                states, actions, step_mask, coords, distance_matrix,
                 forward_policy, backward_policy, device
             )
             
@@ -660,10 +594,9 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 traj_losses = loss_fn(log_pf_sum, log_pb_sum, logreward_batch)
                 total_loss = total_loss + traj_losses.sum()
             else:
-                # DB or SubTB
                 T_plus_1, B, _ = states.shape
                 flat_states = states.reshape(-1, N)
-                flat_log_flows = forward_policy.predict_flow(flat_states, profits, weights, capacity, device)
+                flat_log_flows = forward_policy.predict_flow(flat_states, coords, distance_matrix, device)
                 log_flows = flat_log_flows.view(T_plus_1, B)
                 
                 group_loss = loss_fn(step_log_pf, step_log_pb, log_flows, logreward_batch, step_mask)
@@ -671,7 +604,6 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             
             total_trajs += B_group
         
-        # Average loss
         cumulative_loss = total_loss / max(total_trajs, 1)
         
         reward_history.extend(batch_rewards)
@@ -680,7 +612,6 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
         optimizer.zero_grad()
         cumulative_loss.backward()
         
-        # Gradient clipping
         torch.nn.utils.clip_grad_norm_(forward_policy.parameters(), max_norm=0.5)
         torch.nn.utils.clip_grad_norm_(backward_policy.parameters(), max_norm=0.5)
         if hasattr(loss_fn, 'logZ'):
@@ -688,22 +619,19 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
         
         optimizer.step()
         
-        # Logging
         if step % 50 == 0:
             avg_loss = np.mean(loss_history[-50:]) if len(loss_history) >= 50 else np.mean(loss_history)
             avg_reward = np.mean(reward_history[-50*batch_size:]) if len(reward_history) >= 50*batch_size else np.mean(reward_history)
-            avg_profit = np.mean(batch_profits)
+            avg_length = np.mean(batch_lengths)
             elapsed = time.time() - start_time
             
-            # Calculate average gap across instances
             gaps = []
             for idx, info in best_per_instance.items():
                 if info['optimal'] and info['optimal'] > 0:
-                    gap = (info['optimal'] - info['profit']) / info['optimal'] * 100
+                    gap = (info['length'] - info['optimal']) / info['optimal'] * 100
                     gaps.append(gap)
             avg_gap = np.mean(gaps) if gaps else 0.0
             
-            # ETA
             if step > start_step:
                 steps_remaining = steps - step
                 time_per_step = elapsed / (step - start_step)
@@ -715,10 +643,9 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 eta_str = "--"
             
             print(f"[{step}] loss={cumulative_loss.item():.4f}, log_reward={avg_reward:.2f}, "
-                  f"profit={avg_profit:.1f}, avg_gap={avg_gap:.1f}%, no_improv={steps_without_improvement}, "
+                  f"length={avg_length:.1f}, avg_gap={avg_gap:.1f}%, no_improv={steps_without_improvement}, "
                   f"eps={epsilon:.3f}, ETA={eta_str}", flush=True)
             
-            # Log to file
             log_entry = {
                 "type": "step",
                 "step": step,
@@ -730,12 +657,11 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 "epsilon": float(epsilon),
                 "logZ": float(loss_fn.logZ.item()) if hasattr(loss_fn, 'logZ') else None,
                 "elapsed_seconds": float(elapsed),
-                "best_per_instance": {str(k): float(v['profit']) for k, v in best_per_instance.items()},
+                "best_per_instance": {str(k): float(v['length']) for k, v in best_per_instance.items()},
             }
             with open(log_path, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
         
-        # Save checkpoint
         if (step + 1) % save_every == 0:
             checkpoint = {
                 'step': step + 1,
@@ -754,11 +680,10 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             torch.save(checkpoint, os.path.join(save_dir, ckpt_name))
             print(f"  -> Saved checkpoint: {ckpt_name}", flush=True)
         
-        # Early stopping check
         gaps = []
         for idx, info in best_per_instance.items():
             if info['optimal'] and info['optimal'] > 0:
-                gap = (info['optimal'] - info['profit']) / info['optimal'] * 100
+                gap = (info['length'] - info['optimal']) / info['optimal'] * 100
                 gaps.append(gap)
         avg_gap = np.mean(gaps) if gaps else float('inf')
         
@@ -766,7 +691,6 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             prev_best_avg_gap = avg_gap
             steps_without_improvement = 0
             
-            # Save best checkpoint
             best_checkpoint = {
                 'step': step + 1,
                 'forward_policy': forward_policy.state_dict(),
@@ -790,7 +714,6 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             print(f"\n⚠ Early stopping: no improvement for {early_stop_patience} steps")
             break
     
-    # Save final checkpoint
     final_checkpoint = {
         'step': step + 1,
         'forward_policy': forward_policy.state_dict(),
@@ -808,13 +731,12 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
     torch.save(final_checkpoint, os.path.join(save_dir, final_ckpt_name))
     print(f"  -> Saved final checkpoint: {final_ckpt_name}", flush=True)
     
-    # Final summary
     print(f"\n{'='*60}")
     print("Training Complete - Best Results per Instance:")
     print(f"{'='*60}")
     for idx, info in best_per_instance.items():
-        opt_str = f"/{info['optimal']:.0f}" if info['optimal'] else ""
-        gap_str = f" (gap: {(info['optimal'] - info['profit']) / info['optimal'] * 100:.1f}%)" if info['optimal'] else ""
-        print(f"  {info['name']}: {info['profit']:.0f}{opt_str}{gap_str}")
+        opt_str = f"/{info['optimal']:.1f}" if info['optimal'] else ""
+        gap_str = f" (gap: {(info['length'] - info['optimal']) / info['optimal'] * 100:.1f}%)" if info['optimal'] else ""
+        print(f"  {info['name']}: {info['length']:.1f}{opt_str}{gap_str}")
     
     return best_per_instance
