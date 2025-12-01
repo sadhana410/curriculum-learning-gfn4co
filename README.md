@@ -51,7 +51,9 @@ pip install -r requirements.txt
 
 ### Graph Coloring
 
-Train GFlowNet on Myciel graphs:
+#### Single-Instance Training
+
+Train GFlowNet on a single Myciel graph:
 
 ```bash
 # Train on myciel2 (chromatic number = 3)
@@ -67,9 +69,26 @@ python problems/graph_coloring/main.py --chromatic 5 --max-colors 7 --steps 1000
 python problems/graph_coloring/main.py --chromatic 4 --batch-size 64 --epsilon 0.2 --loss SubTB --steps 5000
 ```
 
-**Arguments:**
-- `--chromatic`: Target chromatic number (selects corresponding myciel graph)
-- `--max-colors`: Maximum number of colors available (default: number of nodes)
+#### Conditional GFlowNet Training
+
+Train a single policy that generalizes across multiple graph instances:
+
+```bash
+# Train on specific graphs
+python problems/graph_coloring/main.py --conditional --graphs myciel3 myciel4 myciel5 --steps 10000
+
+# Train on all available graphs
+python problems/graph_coloring/main.py --conditional --all-graphs --steps 20000
+
+# Train on randomly generated graphs
+python problems/graph_coloring/main.py --conditional --random-graphs 50 --min-nodes 10 --max-nodes 100 --steps 20000
+
+# Resume training from checkpoint
+python problems/graph_coloring/main.py --conditional --graphs myciel3 myciel4 --resume latest
+python problems/graph_coloring/main.py --conditional --graphs myciel3 myciel4 --resume checkpoints/conditional_K47_step_5000.pt
+```
+
+**Common Arguments:**
 - `--steps`: Number of training steps (default: 10000)
 - `--batch-size`: Number of trajectories per training step (default: 128)
 - `--epsilon`: Initial epsilon for exploration, decays to 0.01 (default: 0.1)
@@ -80,30 +99,58 @@ python problems/graph_coloring/main.py --chromatic 4 --batch-size 64 --epsilon 0
 - `--hidden-dim`: Hidden dimension for policy networks (default: 64)
 - `--save-every`: Save checkpoint every N steps (default: 1000)
 
+**Single-Instance Arguments:**
+- `--chromatic`: Target chromatic number (selects corresponding myciel graph)
+- `--max-colors`: Maximum number of colors available (default: number of nodes)
+
+**Conditional Arguments:**
+- `--conditional`: Enable conditional GFlowNet mode
+- `--graphs`: Specific graph names to train on (e.g., myciel3 myciel4)
+- `--all-graphs`: Train on all graphs in data directory
+- `--random-graphs N`: Generate N random Erdos-Renyi graphs
+- `--min-nodes`, `--max-nodes`: Node range for random graphs
+- `--edge-prob`: Edge probability for random graphs (default: 0.3)
+- `--num-layers`: Number of GNN layers (default: 3)
+- `--resume`: Resume from checkpoint (path or 'latest')
+
 Training logs are saved to `problems/graph_coloring/logs/` in JSON Lines format.
+
+#### Checkpoints
+
+The training saves three types of checkpoints:
+- **Periodic**: `{name}_step_{N}.pt` - Saved every `--save-every` steps
+- **Best**: `{name}_best.pt` - Saved when average colors improves
+- **Final**: `{name}_final.pt` - Saved at end of training
 
 #### Evaluation
 
 Evaluate trained models on graph coloring:
 
 ```bash
-# List available graphs
-python problems/graph_coloring/evaluate.py --list
-
-# Evaluate by chromatic number
+# Single-instance evaluation
+python problems/graph_coloring/evaluate.py --list                    # List available graphs
 python problems/graph_coloring/evaluate.py --chromatic 4 --samples 100
-
-# Evaluate specific graph with specific checkpoint
 python problems/graph_coloring/evaluate.py --graph myciel3.col --checkpoint path/to/checkpoint.pt
+
+# Conditional evaluation (evaluate on multiple/unseen graphs)
+python problems/graph_coloring/evaluate.py --conditional --checkpoint checkpoints/conditional_K47_best.pt --graphs myciel5 myciel6
+python problems/graph_coloring/evaluate.py --conditional --checkpoint checkpoints/conditional_K47_best.pt --all-graphs
 ```
 
-**Evaluation Arguments:**
+**Single-Instance Evaluation Arguments:**
 - `--graph`: Graph file to evaluate (e.g., myciel3.col)
 - `--chromatic`: Select graph by chromatic number
 - `--checkpoint`: Path to checkpoint (default: latest in checkpoints/)
 - `--samples`: Number of stochastic samples (default: 100)
 - `--hidden-dim`: Hidden dimension (must match training, default: 64)
 - `--list`: List available graphs
+
+**Conditional Evaluation Arguments:**
+- `--conditional`: Enable conditional evaluation mode
+- `--checkpoint`: Path to conditional checkpoint
+- `--graphs`: Specific graphs to evaluate
+- `--all-graphs`: Evaluate on all graphs
+- `--samples`: Number of stochastic samples (default: 100)
 
 ### Knapsack
 
@@ -194,18 +241,17 @@ Three loss functions are available:
 - **SubTB (Sub-Trajectory Balance)**: Sub-trajectory balance with configurable lambda
 
 ### Key Features
-- Multiple loss functions (TB, DB, SubTB)
-- Epsilon-greedy exploration with decay during training
-- Temperature and Top-P (Nucleus) sampling for exploration control
-- Early stopping with configurable patience
-- Checkpoint saving at configurable intervals (default: every 1000 steps)
-- Reward shaping to encourage optimal solutions
-- Greedy and stochastic evaluation modes
+- **Conditional GFlowNets**: Train a single GNN policy that generalizes across multiple graph instances
+- **Multiple loss functions**: TB, DB, SubTB
+- **Exploration strategies**: Epsilon-greedy with decay, temperature scaling, Top-P (Nucleus) sampling
+- **Training utilities**: Early stopping, checkpoint saving (periodic/best/final), resume from checkpoint
+- **Evaluation modes**: Greedy and stochastic sampling on seen and unseen instances
 
 ## Checkpoint Naming
 
 Checkpoints are saved with problem-specific names:
-- **Graph Coloring**: `{graph}_K{colors}_step_{step}.pt` (e.g., `myciel3_K5_step_1000.pt`)
+- **Graph Coloring (Single)**: `{graph}_K{colors}_step_{step}.pt` (e.g., `myciel3_K11_step_1000.pt`)
+- **Graph Coloring (Conditional)**: `conditional_K{colors}_{type}.pt` where type is `step_N`, `best`, or `final`
 - **Knapsack**: `{problem}_step_{step}.pt` (e.g., `p01_step_1000.pt`)
 
 The evaluation scripts automatically find the latest checkpoint for each problem.

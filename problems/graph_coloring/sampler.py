@@ -279,3 +279,306 @@ def collate_trajectories(trajectories, env, device):
             step_mask[:L, b] = True
 
     return states, actions, step_mask, rewards
+
+
+# ============================================================================
+# Conditional GFlowNet Sampling (for training on multiple graph instances)
+# ============================================================================
+
+def sample_trajectory_conditional(env, forward_policy, adj, device, epsilon=0.1, temperature=1.0):
+    """
+    Sample a single trajectory for conditional GFlowNet.
+    
+    Args:
+        env: ConditionalGraphColoringEnv with current instance set
+        forward_policy: ConditionalGNNPolicy
+        adj: Adjacency matrix for current instance (numpy or tensor)
+        device: torch device
+        epsilon: exploration probability
+        temperature: sampling temperature
+        
+    Returns:
+        (states_list, actions_list, reward, adj)
+    """
+    state = env.reset()
+    traj_states, traj_actions = [], []
+    
+    done = False
+    while not done:
+        traj_states.append(state.copy())
+        
+        with torch.no_grad():
+            logits = forward_policy(state, adj, device=device)
+        mask = torch.tensor(env.allowed_actions(state), dtype=torch.float32, device=device)
+        
+        if mask.sum() == 0:
+            done = True
+            reward = env.reward(state)
+            break
+        
+        if torch.rand(1).item() < epsilon:
+            valid_actions = torch.where(mask > 0)[0]
+            action = valid_actions[torch.randint(len(valid_actions), (1,))].item()
+        else:
+            masked_logits = logits.clone()
+            masked_logits[mask == 0] = float('-inf')
+            probs = torch.softmax(masked_logits / temperature, dim=0)
+            action = torch.multinomial(probs, 1).item()
+        
+        next_state, reward, done = env.step(state, action)
+        traj_actions.append(action)
+        state = next_state
+    
+    traj_states.append(state.copy())
+    return traj_states, traj_actions, reward, adj
+
+
+def sample_trajectories_conditional(env, forward_policy, device, batch_size, 
+                                    epsilon=0.1, temperature=1.0, top_p=1.0):
+    """
+    Sample trajectories from multiple graph instances for conditional GFlowNet.
+    
+    Each trajectory is sampled from a randomly selected graph instance.
+    This is the main sampling function for conditional GFlowNet training.
+    
+    Args:
+        env: ConditionalGraphColoringEnv
+        forward_policy: ConditionalGNNPolicy
+        device: torch device
+        batch_size: number of trajectories to sample
+        epsilon: exploration probability
+        temperature: sampling temperature
+        top_p: nucleus sampling threshold
+        
+    Returns:
+        List of (states_list, actions_list, reward, instance_idx, adj)
+    """
+    trajectories = []
+    
+    for _ in range(batch_size):
+        # Sample a random instance
+        instance_idx = env.sample_instance()
+        adj = env._adj_np
+        
+        # Sample trajectory for this instance
+        states, actions, reward, _ = sample_trajectory_conditional(
+            env, forward_policy, adj, device, epsilon, temperature
+        )
+        
+        trajectories.append((states, actions, reward, instance_idx, adj))
+    
+    return trajectories
+
+
+def sample_trajectories_conditional_batched(env, forward_policy, device, batch_size,
+                                            epsilon=0.1, temperature=1.0, top_p=1.0,
+                                            same_instance=False):
+    """
+    Sample trajectories with batched forward passes when possible.
+    
+    For conditional GFlowNet, we can batch trajectories that share the same graph.
+    If same_instance=True, all trajectories use the same randomly sampled instance.
+    
+    Args:
+        env: ConditionalGraphColoringEnv
+        forward_policy: ConditionalGNNPolicy
+        device: torch device
+        batch_size: number of trajectories
+        epsilon: exploration probability
+        temperature: sampling temperature
+        top_p: nucleus sampling threshold
+        same_instance: if True, use same instance for all trajectories in batch
+        
+    Returns:
+        List of (states_list, actions_list, reward, instance_idx, adj)
+    """
+    if same_instance:
+        # All trajectories use the same instance - can batch efficiently
+        instance_idx = env.sample_instance()
+        adj = env._adj_np
+        N, K = env.N, env.K
+        
+        # Initialize batch of states
+        states = np.stack([env.reset() for _ in range(batch_size)])  # (B, N)
+        trajectories = [{'states': [s.copy()], 'actions': [], 'reward': 0.0, 'done': False} 
+                        for s in states]
+        
+        active_mask = np.ones(batch_size, dtype=bool)
+        
+        # Handle epsilon as tensor
+        if isinstance(epsilon, float):
+            epsilon_t = torch.full((batch_size,), epsilon, device=device)
+        else:
+            epsilon_t = epsilon
+        
+        while active_mask.any():
+            active_indices = np.where(active_mask)[0]
+            active_states = states[active_indices]
+            A = len(active_indices)
+            
+            # Batch forward pass
+            with torch.no_grad():
+                active_states_t = torch.from_numpy(active_states).to(device=device, dtype=torch.long)
+                logits_batch = forward_policy(active_states_t, adj, device=device)
+                masks_batch = get_batched_mask(active_states, env, device).bool()
+            
+            # Check stuck
+            valid_counts = masks_batch.sum(dim=1)
+            stuck_rel = (valid_counts == 0).cpu().numpy()
+            
+            if stuck_rel.any():
+                stuck_indices = active_indices[stuck_rel]
+                for idx in stuck_indices:
+                    trajectories[idx]['done'] = True
+                    trajectories[idx]['reward'] = env.reward(states[idx])
+                    active_mask[idx] = False
+                
+                keep_rel = ~stuck_rel
+                if not keep_rel.any():
+                    break
+                
+                active_indices = active_indices[keep_rel]
+                active_states = active_states[keep_rel]
+                logits_batch = logits_batch[torch.from_numpy(keep_rel).to(device)]
+                masks_batch = masks_batch[torch.from_numpy(keep_rel).to(device)]
+                A = len(active_indices)
+            
+            # Sampling
+            logits_batch[~masks_batch] = float('-inf')
+            probs = torch.softmax(logits_batch / temperature, dim=1)
+            
+            # Top-P sampling
+            if top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                probs[indices_to_remove] = 0.0
+                probs = probs / (probs.sum(dim=1, keepdim=True) + 1e-8)
+            
+            policy_actions = torch.multinomial(probs, 1).squeeze(-1)
+            
+            # Uniform sampling for exploration
+            uniform_logits = torch.zeros_like(logits_batch)
+            uniform_logits[~masks_batch] = float('-inf')
+            uniform_probs = torch.softmax(uniform_logits, dim=1)
+            random_actions = torch.multinomial(uniform_probs, 1).squeeze(-1)
+            
+            # Epsilon-greedy
+            active_eps = epsilon_t[active_indices]
+            rand_draw = torch.rand(A, device=device)
+            explore_mask = (rand_draw < active_eps)
+            final_actions = torch.where(explore_mask, random_actions, policy_actions)
+            
+            actions_np = final_actions.cpu().numpy()
+            
+            # Step
+            next_states, rewards, dones = env.step_batch(states[active_indices], actions_np)
+            states[active_indices] = next_states
+            
+            for i, idx in enumerate(active_indices):
+                trajectories[idx]['actions'].append(int(actions_np[i]))
+                trajectories[idx]['states'].append(next_states[i].copy())
+                
+                if dones[i]:
+                    trajectories[idx]['done'] = True
+                    trajectories[idx]['reward'] = float(rewards[i])
+                    active_mask[idx] = False
+        
+        # Convert to output format
+        results = [(t['states'], t['actions'], t['reward'], instance_idx, adj) 
+                   for t in trajectories]
+        return results
+    
+    else:
+        # Different instances - sample sequentially
+        return sample_trajectories_conditional(
+            env, forward_policy, device, batch_size, epsilon, temperature, top_p
+        )
+
+
+def collate_trajectories_conditional(trajectories, num_colors, device):
+    """
+    Collate trajectories from conditional GFlowNet sampling.
+    
+    Since trajectories may come from different-sized graphs, we need to handle
+    variable sizes. This function groups trajectories by graph size for efficient
+    batched processing.
+    
+    Args:
+        trajectories: List of (states_list, actions_list, reward, instance_idx, adj)
+        num_colors: K, number of colors
+        device: torch device
+        
+    Returns:
+        Dictionary with collated data grouped by graph size:
+        {
+            N: {
+                'states': (T_max+1, B_N, N),
+                'actions': (T_max, B_N),
+                'step_mask': (T_max, B_N),
+                'rewards': (B_N,),
+                'adj': (N, N) or list of adj matrices,
+                'indices': original trajectory indices
+            }
+        }
+    """
+    # Group by graph size
+    by_size = {}
+    for i, (states_list, actions_list, reward, instance_idx, adj) in enumerate(trajectories):
+        N = len(states_list[0])
+        if N not in by_size:
+            by_size[N] = []
+        by_size[N].append((i, states_list, actions_list, reward, adj))
+    
+    result = {}
+    for N, group in by_size.items():
+        B = len(group)
+        lengths = [len(actions) for (_, _, actions, _, _) in group]
+        T_max = max(lengths) if lengths else 1
+        
+        states = torch.full((T_max + 1, B, N), fill_value=-1, dtype=torch.long, device=device)
+        actions = torch.zeros((T_max, B), dtype=torch.long, device=device)
+        step_mask = torch.zeros((T_max, B), dtype=torch.bool, device=device)
+        rewards = torch.zeros(B, dtype=torch.float32, device=device)
+        indices = []
+        adjs = []
+        
+        for b, (orig_idx, states_list, actions_list, reward, adj) in enumerate(group):
+            L = len(actions_list)
+            rewards[b] = float(reward)
+            indices.append(orig_idx)
+            adjs.append(adj)
+            
+            s_np = np.stack(states_list)
+            s_t = torch.from_numpy(s_np).to(device=device, dtype=torch.long)
+            states[:L+1, b, :] = s_t
+            
+            if L > 0:
+                a_t = torch.tensor(actions_list, dtype=torch.long, device=device)
+                actions[:L, b] = a_t
+                step_mask[:L, b] = True
+        
+        # Stack adjacency matrices if all same, else keep list
+        if len(set(id(a) for a in adjs)) == 1:
+            # All same adjacency matrix
+            adj_tensor = torch.from_numpy(adjs[0]).to(device=device, dtype=torch.float32)
+        else:
+            # Different adjacency matrices - stack them
+            adj_tensor = torch.stack([
+                torch.from_numpy(a).to(device=device, dtype=torch.float32) for a in adjs
+            ])
+        
+        result[N] = {
+            'states': states,
+            'actions': actions,
+            'step_mask': step_mask,
+            'rewards': rewards,
+            'adj': adj_tensor,
+            'indices': indices,
+            'K': num_colors
+        }
+    
+    return result
