@@ -19,6 +19,7 @@ curriculum-learning-gfn4co/
 │   │   ├── data/                # Myciel graph instances (.col files)
 │   │   ├── checkpoints/         # Saved model checkpoints
 │   │   ├── logs/                # Training logs (JSONL)
+│   │   ├── distribution/        # Sample distribution plots (updated during training)
 │   │   ├── env.py               # Graph coloring environment
 │   │   ├── policy.py            # GNN policy network
 │   │   ├── sampler.py           # Trajectory sampler
@@ -26,7 +27,8 @@ curriculum-learning-gfn4co/
 │   │   ├── utils.py             # Graph loading utilities
 │   │   ├── main.py              # Training script
 │   │   ├── train_curriculum.py  # Curriculum learning script
-│   │   └── evaluate.py          # Evaluation script
+│   │   ├── evaluate.py          # Evaluation script
+│   │   └── plot_distribution.py # Plot sample distribution
 │   ├── knapsack/
 │   │   ├── data/                # Knapsack instances (p01/, p02/, ...)
 │   │   ├── checkpoints/         # Saved model checkpoints
@@ -105,8 +107,8 @@ python problems/graph_coloring/main.py --conditional --graphs myciel3 myciel4 --
 Train with curriculum learning, gradually adding harder graphs (myciel2 → myciel3 → ... → myciel7):
 
 ```bash
-# Full curriculum (all stages: myciel2 -> myciel7)
-python problems/graph_coloring/train_curriculum.py --steps-per-stage 5000 --max-colors 191
+# Full curriculum with config file (recommended)
+python problems/graph_coloring/train_curriculum.py --config problems/graph_coloring/curriculum_config.json
 
 # Partial curriculum (up to myciel5)
 python problems/graph_coloring/train_curriculum.py --stages myciel2 myciel3 myciel4 myciel5 --steps-per-stage 5000
@@ -117,13 +119,42 @@ python problems/graph_coloring/train_curriculum.py --steps-per-stage 10000 --bat
 
 **How it works:**
 1. **Stage 1**: Train on myciel2 only
-2. **Stage 2**: Add myciel3, resume from Stage 1 checkpoint
-3. **Stage 3**: Add myciel4, resume from Stage 2 checkpoint
+2. **Stage 2**: Add myciel3, resume from Stage 1 best checkpoint
+3. **Stage 3**: Add myciel4, resume from Stage 2 best checkpoint
 4. ... and so on until all stages are complete
 
-Each stage trains for `--steps-per-stage` steps, then saves a checkpoint and moves to the next stage. The policy learns easier graphs first, then progressively harder ones.
+Each stage trains until completion, saves the best checkpoint (based on distribution mean), and moves to the next stage. The policy learns easier graphs first, then progressively harder ones.
+
+**Live Plotting:** During training, distribution plots show the initial distribution vs current distribution. For instances from previous stages, the initial distribution is taken from the best checkpoint of that stage.
+
+**Curriculum Config File (`curriculum_config.json`):**
+```json
+{
+    "stages": ["myciel2", "myciel3", "myciel4", "myciel5"],
+    "default": {
+        "steps": 5000,
+        "lr": 0.001,
+        "batch_size": 128,
+        "epsilon": 0.1,
+        "alpha": 1.0,
+        "beta": 0.5,
+        "gamma": 0.2
+    },
+    "stage_params": {
+        "myciel2": {
+            "steps": 1000,
+            "lr": 0.01,
+            "epsilon": 0.1,
+            "beta": 2.0
+        }
+    }
+}
+```
+
+Stage-specific parameters override defaults. Reward parameters (α, β, γ) can be tuned per stage.
 
 **Curriculum Arguments:**
+- `--config`: Path to curriculum config JSON file (recommended)
 - `--stages`: Specific stages to train (default: myciel2 through myciel7)
 - `--steps-per-stage`: Training steps per stage (default: 5000)
 
@@ -176,9 +207,8 @@ python problems/graph_coloring/evaluate.py --conditional --checkpoint checkpoint
 python problems/graph_coloring/evaluate.py --conditional --checkpoint checkpoints/conditional_K47_best.pt --all-graphs
 ```
 
-**Single-Instance Evaluation Arguments:**
-- `--graph`: Graph file to evaluate (e.g., myciel3.col)
-- `--chromatic`: Select graph by chromatic number
+**Single-Instance Evaluat
+romatic number
 - `--checkpoint`: Path to checkpoint (default: latest in checkpoints/)
 - `--samples`: Number of stochastic samples (default: 100)
 - `--hidden-dim`: Hidden dimension (must match training, default: 64)

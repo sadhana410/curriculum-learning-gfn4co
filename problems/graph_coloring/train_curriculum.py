@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import random
 from datetime import datetime
 import numpy as np
 import torch
@@ -31,6 +32,20 @@ from losses.detailedbalance import DetailedBalance
 from losses.subtrajectorybalance import SubTrajectoryBalance
 
 
+def set_seed(seed: int):
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # For full determinism (may reduce performance)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"Random seed set to: {seed}")
+
+
 # Data directory
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
@@ -46,6 +61,188 @@ CHROMATIC_NUMBERS = {
     "myciel6.col": 7,
     "myciel7.col": 8,
 }
+
+
+class CurriculumScheduler:
+    """
+    Scheduler for curriculum learning with per-stage hyperparameters.
+    
+    Allows customizing learning rate, batch size, epsilon, temperature, etc.
+    for each stage of curriculum learning.
+    
+    Example usage:
+        scheduler = CurriculumScheduler(
+            stages=["myciel2", "myciel3", "myciel4"],
+            default_params={
+                "steps": 5000,
+                "lr": 1e-3,
+                "batch_size": 128,
+                "epsilon": 0.1,
+                "temperature": 1.0,
+            },
+            stage_params={
+                "myciel2": {"steps": 2000, "lr": 1e-3},  # Quick warmup
+                "myciel3": {"steps": 5000, "lr": 5e-4},  # Standard training
+                "myciel4": {"steps": 10000, "lr": 1e-4, "epsilon": 0.05},  # Fine-tuning
+            }
+        )
+        
+        for stage in scheduler:
+            params = scheduler.get_params(stage)
+            # Train with params...
+    """
+    
+    def __init__(self, stages, default_params=None, stage_params=None, cumulative=True):
+        """
+        Args:
+            stages: List of stage names (e.g., ["myciel2", "myciel3", "myciel4"])
+            default_params: Default hyperparameters for all stages
+            stage_params: Dict mapping stage name to stage-specific params (overrides defaults)
+            cumulative: If True, each stage includes all previous graphs. If False, each stage only has its own graph.
+        """
+        self.stages = stages
+        self.cumulative = cumulative
+        self.default_params = default_params or {
+            "steps": 5000,
+            "lr": 1e-3,
+            "batch_size": 128,
+            "epsilon": 0.1,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "patience": -1,
+            "save_every": 1000,
+            "alpha": 1.0,   # Reward: conflict penalty
+            "beta": 0.5,    # Reward: color usage penalty
+            "gamma": 0.2,   # Reward: uncolored penalty
+        }
+        self.stage_params = stage_params or {}
+        self.current_stage_idx = 0
+    
+    def __iter__(self):
+        self.current_stage_idx = 0
+        return self
+    
+    def __next__(self):
+        if self.current_stage_idx >= len(self.stages):
+            raise StopIteration
+        stage = self.stages[self.current_stage_idx]
+        self.current_stage_idx += 1
+        return stage
+    
+    def __len__(self):
+        return len(self.stages)
+    
+    def get_params(self, stage):
+        """Get hyperparameters for a specific stage."""
+        params = self.default_params.copy()
+        if stage in self.stage_params:
+            params.update(self.stage_params[stage])
+        return params
+    
+    def get_stage_idx(self, stage):
+        """Get the index of a stage."""
+        return self.stages.index(stage)
+    
+    def get_graphs_for_stage(self, stage):
+        """Get graphs for this stage based on cumulative setting."""
+        if self.cumulative:
+            # Include all graphs up to and including this stage
+            idx = self.get_stage_idx(stage)
+            return self.stages[:idx + 1]
+        else:
+            # Only include this stage's graph
+            return [stage]
+    
+    @classmethod
+    def from_args(cls, args):
+        """Create scheduler from command-line arguments."""
+        stages = args.stages if args.stages else CURRICULUM_ORDER
+        stages = [s for s in stages if s in CURRICULUM_ORDER]
+        
+        default_params = {
+            "steps": args.steps_per_stage,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "epsilon": args.epsilon,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "patience": args.patience,
+            "save_every": args.save_every,
+        }
+        
+        # Load stage-specific params from config file if provided
+        stage_params = {}
+        cumulative = True  # Default to cumulative
+        if hasattr(args, 'config') and args.config:
+            config = cls.load_config(args.config)
+            if 'stages' in config and not args.stages:
+                stages = config['stages']
+                stages = [s for s in stages if s in CURRICULUM_ORDER]
+            if 'default' in config:
+                default_params.update(config['default'])
+            if 'stage_params' in config:
+                stage_params = config['stage_params']
+            if 'cumulative' in config:
+                cumulative = config['cumulative']
+        
+        return cls(stages, default_params, stage_params, cumulative)
+    
+    @classmethod
+    def load_config(cls, config_path):
+        """
+        Load curriculum config from a JSON file.
+        
+        Example config file (curriculum_config.json):
+        {
+            "stages": ["myciel2", "myciel3", "myciel4", "myciel5"],
+            "default": {
+                "steps": 5000,
+                "lr": 0.001,
+                "batch_size": 128,
+                "epsilon": 0.1
+            },
+            "stage_params": {
+                "myciel2": {"steps": 2000, "lr": 0.001},
+                "myciel3": {"steps": 5000, "lr": 0.0005},
+                "myciel4": {"steps": 10000, "lr": 0.0001, "epsilon": 0.05},
+                "myciel5": {"steps": 20000, "lr": 0.00005, "epsilon": 0.02}
+            }
+        }
+        """
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        return config
+    
+    def save_config(self, config_path):
+        """Save current curriculum config to a JSON file."""
+        config = {
+            "stages": self.stages,
+            "cumulative": self.cumulative,
+            "default": self.default_params,
+            "stage_params": self.stage_params,
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"Saved curriculum config to: {config_path}")
+    
+    def summary(self):
+        """Print a summary of the curriculum schedule."""
+        print("Curriculum Schedule:")
+        print(f"Mode: {'Cumulative' if self.cumulative else 'Non-cumulative (single graph per stage)'}")
+        print("-" * 60)
+        for i, stage in enumerate(self.stages):
+            params = self.get_params(stage)
+            graphs = self.get_graphs_for_stage(stage)
+            print(f"  Stage {i+1}: {stage}")
+            print(f"    Graphs: {', '.join(graphs)}")
+            print(f"    Steps: {params['steps']}, LR: {params['lr']}, "
+                  f"Batch: {params.get('batch_size', 128)}, ε: {params.get('epsilon', 0.1)}")
+            print(f"    Reward: α={params.get('alpha', 1.0)}, β={params.get('beta', 0.5)}, γ={params.get('gamma', 0.2)}")
+        print("-" * 60)
 
 
 def load_graph(name):
@@ -106,18 +303,9 @@ def train_curriculum(args):
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
     
-    # Parse curriculum stages
-    if args.stages:
-        stages = args.stages
-    else:
-        # Default: all myciel graphs
-        stages = CURRICULUM_ORDER
-    
-    # Validate stages
-    for stage in stages:
-        if stage not in CURRICULUM_ORDER:
-            print(f"Warning: Unknown graph '{stage}', skipping")
-    stages = [s for s in stages if s in CURRICULUM_ORDER]
+    # Create curriculum scheduler
+    scheduler = CurriculumScheduler.from_args(args)
+    stages = scheduler.stages
     
     if not stages:
         print("Error: No valid stages specified")
@@ -127,8 +315,14 @@ def train_curriculum(args):
     print("CURRICULUM LEARNING FOR GRAPH COLORING")
     print("=" * 60)
     print(f"Stages: {' -> '.join(stages)}")
-    print(f"Steps per stage: {args.steps_per_stage}")
     print(f"Total stages: {len(stages)}")
+    
+    # Show schedule if config file provided or stage params exist
+    if scheduler.stage_params:
+        print()
+        scheduler.summary()
+    else:
+        print(f"Default steps per stage: {args.steps_per_stage}")
     print()
     
     # Directories
@@ -145,10 +339,9 @@ def train_curriculum(args):
     curriculum_config = {
         "type": "curriculum_config",
         "stages": stages,
-        "steps_per_stage": args.steps_per_stage,
+        "default_params": scheduler.default_params,
+        "stage_params": scheduler.stage_params,
         "max_colors": args.max_colors,
-        "batch_size": args.batch_size,
-        "lr": args.lr,
         "loss": args.loss,
         "timestamp": timestamp,
     }
@@ -165,12 +358,19 @@ def train_curriculum(args):
     backward = None
     loss_fn = None
     optimizer = None
+    current_lr = args.lr  # Track current LR for optimizer updates
     
     # Track results across stages
     all_results = {}
     
+    # Track best distributions from previous stages for plotting
+    prev_stage_distributions = {}  # instance_name -> {'distribution': {...}, 'step': int}
+    
     # Train each stage
     for stage_idx, stage_name in enumerate(stages):
+        # Get stage-specific parameters
+        stage_params = scheduler.get_params(stage_name)
+        
         print()
         print("=" * 60)
         print(f"STAGE {stage_idx + 1}/{len(stages)}: Training up to {stage_name}")
@@ -192,6 +392,12 @@ def train_curriculum(args):
         # Create environment
         env = ConditionalGraphColoringEnv(instances, num_colors=K)
         
+        # Set reward parameters for this stage
+        alpha = stage_params.get('alpha', 1.0)
+        beta = stage_params.get('beta', 0.5)
+        gamma = stage_params.get('gamma', 0.2)
+        env.set_reward_params(alpha=alpha, beta=beta, gamma=gamma)
+        
         # Initialize or update policy
         if shared_policy is None:
             # First stage: create new policy
@@ -211,10 +417,11 @@ def train_curriculum(args):
             elif args.loss == "SubTB":
                 loss_fn = SubTrajectoryBalance(forward, backward, lambda_=1.0).to(device)
             
-            # Optimizer
+            # Optimizer with stage-specific learning rate
+            current_lr = stage_params['lr']
             optimizer = torch.optim.Adam(
                 list(shared_policy.parameters()) + list(loss_fn.parameters()),
-                lr=args.lr
+                lr=current_lr
             )
             
             resume_from = None
@@ -229,46 +436,68 @@ def train_curriculum(args):
             else:
                 print(f"  Warning: No checkpoint found for previous stage, continuing with current weights")
                 resume_from = None
+            
+            # Update learning rate if changed for this stage
+            new_lr = stage_params['lr']
+            if new_lr != current_lr:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = new_lr
+                current_lr = new_lr
+                print(f"  Updated learning rate to: {new_lr}")
         
         # Problem name for this stage
         problem_name = f"curriculum_stage{stage_idx + 1}_{'-'.join(current_graphs)}_K{K}"
         
+        # Print stage parameters
         print(f"\n  Problem name: {problem_name}")
-        print(f"  Training for {args.steps_per_stage} steps...")
+        print(f"  Steps: {stage_params['steps']}, LR: {stage_params['lr']}, "
+              f"Batch: {stage_params['batch_size']}, ε: {stage_params['epsilon']}")
+        print(f"  Reward: α={alpha}, β={beta}, γ={gamma}")
         print()
         
         # Train this stage
         stage_start_time = time.time()
         
-        best_per_instance = train_conditional(
+        best_per_instance, init_dist_info = train_conditional(
             env=env,
             forward_policy=forward,
             backward_policy=backward,
             loss_fn=loss_fn,
             optimizer=optimizer,
-            steps=args.steps_per_stage,
+            steps=stage_params['steps'],
             device=device,
             save_dir=save_dir,
             problem_name=problem_name,
-            batch_size=args.batch_size,
-            epsilon_start=args.epsilon,
+            batch_size=stage_params['batch_size'],
+            epsilon_start=stage_params['epsilon'],
             log_dir=log_dir,
-            save_every=args.save_every,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            early_stop_patience=args.patience,
+            save_every=stage_params['save_every'],
+            temperature=stage_params['temperature'],
+            top_p=stage_params['top_p'],
+            early_stop_patience=stage_params['patience'],
             same_instance_per_batch=args.same_instance_per_batch,
-            resume_from=resume_from
+            resume_from=resume_from,
+            prev_stage_distributions=prev_stage_distributions if stage_idx > 0 else None,
+            current_stage_instance=stage_name  # Use current stage graph for best checkpoint criterion
         )
         
         stage_time = time.time() - stage_start_time
         
-        # Log stage results
+        # Load best distributions from this stage's best checkpoint for next stage
+        best_ckpt_path = os.path.join(save_dir, f'{problem_name}_best.pt')
+        if os.path.exists(best_ckpt_path):
+            best_ckpt = torch.load(best_ckpt_path, map_location='cpu', weights_only=False)
+            if 'best_distributions' in best_ckpt:
+                # Update prev_stage_distributions with this stage's best distributions
+                prev_stage_distributions.update(best_ckpt['best_distributions'])
+        
+        # Log stage results with initial distribution
         stage_results = {
             "type": "stage_complete",
             "stage": stage_idx + 1,
             "stage_name": stage_name,
             "graphs": current_graphs,
+            "initial_distributions": init_dist_info,
             "best_per_instance": {str(k): v['colors'] for k, v in best_per_instance.items()},
             "stage_time_seconds": stage_time,
         }
@@ -327,6 +556,9 @@ Examples:
 
   # Custom steps per stage
   python train_curriculum.py --steps-per-stage 5000
+
+  # Load config from file
+  python train_curriculum.py --config curriculum_config.json
         """
     )
     
@@ -334,7 +566,9 @@ Examples:
     parser.add_argument("--stages", nargs="+", default=None,
                         help="Curriculum stages (default: myciel2 through myciel7)")
     parser.add_argument("--steps-per-stage", type=int, default=5000,
-                        help="Training steps per curriculum stage (default: 5000)")
+                        help="Default training steps per stage (default: 5000)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to curriculum config JSON file with per-stage hyperparameters")
     
     # Training arguments
     parser.add_argument("--lr", type=float, default=1e-3,
@@ -349,8 +583,8 @@ Examples:
                         help="Sampling temperature (default: 1.0)")
     parser.add_argument("--top-p", type=float, default=1.0,
                         help="Nucleus sampling threshold (default: 1.0)")
-    parser.add_argument("--patience", type=int, default=2000,
-                        help="Early stopping patience per stage (default: 2000)")
+    parser.add_argument("--patience", type=int, default=-1,
+                        help="Early stopping patience per stage (-1 to disable)")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="Checkpoint frequency (default: 1000)")
     parser.add_argument("--loss", type=str, default="TB", choices=["TB", "DB", "SubTB"],
@@ -363,8 +597,14 @@ Examples:
                         help="Use same instance per batch (default: True)")
     parser.add_argument("--mixed-batch", dest="same_instance_per_batch", action="store_false",
                         help="Mix instances in batch")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
     
     args = parser.parse_args()
+    
+    # Set deterministic random seeds
+    set_seed(args.seed)
+    
     train_curriculum(args)
 
 

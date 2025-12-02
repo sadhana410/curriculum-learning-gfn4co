@@ -1,0 +1,49 @@
+{
+    "stages": [
+        "myciel2",
+        "myciel3",
+        "myciel4",
+        "myciel5"
+    ],
+    "cumulative": false,
+    "default": {
+        "steps": 2000,
+        "lr": 0.001,
+        "batch_size": 128,
+        "epsilon": 0.1,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "patience": -1,
+        "save_every": 1000,
+        "alpha": 1.0,
+        "beta": 0.5,
+        "gamma": 0.2
+    },
+    "stage_params": {
+        "myciel2": {
+            "steps": 1000,
+            "lr": 0.01,
+            "epsilon": 0.1,
+            "batch_size": 128,
+            "beta": 2.0
+        },
+        "myciel3": {
+            "steps": 2000,
+            "lr": 0.005,
+            "epsilon": 0.1,
+            "beta": 3.0
+        },
+        "myciel4": {
+            "steps": 3000,
+            "lr": 0.005,
+            "epsilon": 0.1,
+            "beta": 4.0
+        },
+        "myciel5": {
+            "steps": 5000,
+            "lr": 0.005,
+            "epsilon": 0.1,
+            "beta": 5.0
+        }
+    }
+}

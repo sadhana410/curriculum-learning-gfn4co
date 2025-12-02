@@ -336,7 +336,7 @@ def main():
                         help="Sampling temperature (higher = more exploration)")
     parser.add_argument("--top-p", type=float, default=1.0,
                         help="Top-P (Nucleus) sampling threshold (0.0-1.0)")
-    parser.add_argument("--patience", type=int, default=5000,
+    parser.add_argument("--patience", type=int, default=-1,
                         help="Early stopping patience (steps without improvement)")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="Save checkpoint every N steps")

@@ -7,6 +7,9 @@ from datetime import datetime
 import torch
 import torch.nn.functional as F
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for saving plots
+import matplotlib.pyplot as plt
 
 from problems.graph_coloring.sampler import (
     sample_trajectories_batched, collate_trajectories, get_batched_mask,
@@ -23,6 +26,118 @@ def get_inf_tensor(device):
     if _inf_tensor is None or _inf_tensor.device != device:
         _inf_tensor = torch.tensor(float('-inf'), device=device)
     return _inf_tensor
+
+
+def plot_sample_distribution(sample_dist, step, chromatic, problem_name, save_path, 
+                              history=None, instance_name=None, init_dist=None, init_step=0,
+                              best_dist=None, best_step=None):
+    """
+    Plot and save sample distribution during training.
+    
+    Args:
+        sample_dist: Dict mapping colors -> count (current step) - used as fallback for right plot
+        step: Current training step
+        chromatic: Chromatic number (optimal)
+        problem_name: Name for the plot title
+        save_path: Path to save the plot
+        history: Optional list of (step, mean, std) tuples for tracking progress (unused)
+        instance_name: Optional instance name for conditional training
+        init_dist: Optional dict mapping colors -> count for initial distribution
+        init_step: Step number for the initial distribution (default 0, but can be different for resumed stages)
+        best_dist: Optional dict mapping colors -> count for best distribution (shown on right)
+        best_step: Step number when best distribution was achieved
+    """
+    if not sample_dist:
+        return
+    
+    # Helper function to plot a single histogram
+    def plot_histogram(ax, dist, title):
+        min_c = min(dist.keys())
+        max_c = max(dist.keys())
+        
+        # Extend range to include chromatic number if needed
+        if chromatic:
+            min_c = min(min_c, chromatic)
+            max_c = max(max_c, chromatic)
+        
+        x = list(range(min_c, max_c + 1))
+        y = [dist.get(c, 0) for c in x]
+        total = sum(y)
+        y_pct = [100 * v / total if total > 0 else 0 for v in y]
+        
+        # Color bars
+        bar_colors = []
+        for c in x:
+            if chromatic and c == chromatic:
+                bar_colors.append('green')
+            elif chromatic and c < chromatic:
+                bar_colors.append('darkgreen')
+            else:
+                bar_colors.append('steelblue')
+        
+        bars = ax.bar(x, y_pct, color=bar_colors, edgecolor='black', alpha=0.8)
+        
+        # Add count labels
+        for bar, count, pct in zip(bars, y, y_pct):
+            if pct > 3:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                        f'{count}', ha='center', va='bottom', fontsize=8)
+        
+        # Statistics
+        colors_list = []
+        for c, count in dist.items():
+            colors_list.extend([c] * count)
+        mean_c = np.mean(colors_list) if colors_list else 0
+        std_c = np.std(colors_list) if colors_list else 0
+        
+        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.set_xlabel('Number of Colors', fontsize=10)
+        ax.set_ylabel('Percentage (%)', fontsize=10)
+        
+        stats_text = f"μ={mean_c:.2f}, σ={std_c:.2f}\nn={total}"
+        ax.text(0.95, 0.95, stats_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Always show chromatic number line
+        if chromatic:
+            ax.axvline(x=chromatic, color='red', linestyle='--', linewidth=2, label=f'χ={chromatic}')
+            ax.legend(loc='upper left', fontsize=8)
+        
+        ax.set_xticks(x)
+        ax.grid(axis='y', alpha=0.3)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    
+    # Left plot: Initial distribution (at init_step)
+    ax1 = axes[0]
+    if init_dist:
+        title0 = f"Step {init_step} (Initial)"
+        if instance_name:
+            title0 = f"{instance_name} - Step {init_step}"
+        plot_histogram(ax1, init_dist, title0)
+    else:
+        ax1.text(0.5, 0.5, 'No initial data', ha='center', va='center', 
+                transform=ax1.transAxes, fontsize=12)
+        ax1.set_title(f'Step {init_step} (Initial)', fontsize=11, fontweight='bold')
+    
+    # Right plot: Best distribution (or current if no best available)
+    ax2 = axes[1]
+    if best_dist is not None and best_step is not None:
+        title_best = f"Step {best_step} (Best)"
+        if instance_name:
+            title_best = f"{instance_name} - Step {best_step} (Best)"
+        plot_histogram(ax2, best_dist, title_best)
+    else:
+        title_curr = f"Step {step}"
+        if instance_name:
+            title_curr = f"{instance_name} - Step {step}"
+        plot_histogram(ax2, sample_dist, title_curr)
+    
+    plt.suptitle(problem_name, fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+    plt.close(fig)
 
 
 # def compute_logprobs(states, actions, forward_policy, backward_policy, env, device):
@@ -186,9 +301,12 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
     best_colors = env.K
     best_state = None
     
-    # Early stopping tracking
+    # Early stopping tracking based on distribution mean
     steps_without_improvement = 0
-    prev_best_colors = env.K
+    prev_mean_colors = float('inf')
+    
+    # Track distribution history for plotting
+    distribution_history = []  # List of (step, mean, std)
     
     # Create checkpoint and log directories
     os.makedirs(save_dir, exist_ok=True)
@@ -198,6 +316,11 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_name = f"{problem_name}_{timestamp}" if problem_name else f"train_{timestamp}"
     log_path = os.path.join(log_dir, f"{log_name}.jsonl")
+    
+    # Setup distribution plot path in separate folder
+    dist_dir = os.path.join(os.path.dirname(log_dir), "distribution")
+    os.makedirs(dist_dir, exist_ok=True)
+    plot_path = os.path.join(dist_dir, f"{log_name}_distribution.png")
     
     # Detect loss type
     loss_type = "TB"
@@ -226,6 +349,43 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
     
     print(f"Logging to: {log_path}")
     start_time = time.time()
+    
+    # Initial step 0 sampling for baseline comparison
+    with torch.no_grad():
+        init_trajectories = sample_trajectories_batched(
+            env, forward_policy, device, batch_size,
+            epsilon=epsilon_start, temperature=temperature, top_p=top_p
+        )
+        init_sample_dist = {}
+        for traj_states, traj_actions, reward in init_trajectories:
+            last_state = traj_states[-1]
+            colored = np.sum(last_state != -1)
+            if colored == env.N:
+                colors_in_state = len(set(c for c in last_state if c != -1))
+                conflicts = 0
+                adj = env._adj_np if hasattr(env, '_adj_np') else env.adj
+                for u in range(env.N):
+                    for v in range(u + 1, env.N):
+                        if adj[u, v] == 1 and last_state[u] == last_state[v]:
+                            conflicts += 1
+                if conflicts == 0:
+                    init_sample_dist[colors_in_state] = init_sample_dist.get(colors_in_state, 0) + 1
+        
+        # Record step 0 in history and plot
+        if init_sample_dist:
+            colors_list = []
+            for c, count in init_sample_dist.items():
+                colors_list.extend([c] * count)
+            if colors_list:
+                mean_colors = np.mean(colors_list)
+                std_colors = np.std(colors_list)
+                distribution_history.append((0, mean_colors, std_colors))
+                chromatic = getattr(env, 'chromatic_number', None)
+                plot_sample_distribution(
+                    init_sample_dist, 0, chromatic, problem_name or "Training",
+                    plot_path, history=distribution_history
+                )
+                print(f"[0] Initial distribution: {mean_colors:.2f}±{std_colors:.2f} colors, range=[{min(init_sample_dist.keys())},{max(init_sample_dist.keys())}], valid={sum(init_sample_dist.values())}/{batch_size}")
 
     for step in range(steps):
         # Epsilon decays from epsilon_start to 0.01
@@ -238,6 +398,9 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
         )
         
         batch_rewards = []
+        
+        # Track sample distribution for this batch
+        batch_sample_dist = {}  # colors -> count
 
         # First pass: logging / best-color tracking (same logic as before)
         for traj_states, traj_actions, reward in batch_trajectories:
@@ -258,6 +421,11 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
                     for v in range(u + 1, env.N):
                         if adj[u, v] == 1 and last_terminal_state[u] == last_terminal_state[v]:
                             conflicts += 1
+                
+                # Track sample distribution (only valid colorings)
+                if conflicts == 0:
+                    batch_sample_dist[colors_in_state] = batch_sample_dist.get(colors_in_state, 0) + 1
+                
                 if conflicts == 0 and colors_in_state < best_colors:
                     best_colors = colors_in_state
                     best_state = last_terminal_state.copy()
@@ -337,6 +505,26 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
             gap = best_colors - chromatic if chromatic else 0
             print(f"[{step}] loss={cumulative_loss.item():.4f}, log_reward={avg_reward:.2f}, colored={colored}/{env.N}, colors={colors_used}/{env.K}, best={best_colors}{chromatic_str}, gap={gap}, no_improv={steps_without_improvement}, eps={epsilon:.3f}, ETA={eta_str}", flush=True)
             
+            # Print sample distribution (mean ± std) and update plot
+            if batch_sample_dist:
+                colors_list = []
+                for c, count in batch_sample_dist.items():
+                    colors_list.extend([c] * count)
+                if colors_list:
+                    mean_colors = np.mean(colors_list)
+                    std_colors = np.std(colors_list)
+                    min_colors = min(batch_sample_dist.keys())
+                    max_colors = max(batch_sample_dist.keys())
+                    total_valid = sum(batch_sample_dist.values())
+                    print(f"    samples: {mean_colors:.2f}±{std_colors:.2f} colors, range=[{min_colors},{max_colors}], valid={total_valid}/{batch_size}", flush=True)
+                    
+                    # Track history and update plot
+                    distribution_history.append((step, mean_colors, std_colors))
+                    plot_sample_distribution(
+                        batch_sample_dist, step, chromatic, problem_name or "Training",
+                        plot_path, history=distribution_history, init_dist=init_sample_dist
+                    )
+            
             # Log to file
             log_entry = {
                 "type": "step",
@@ -353,6 +541,7 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
                 "epsilon": epsilon,
                 "logZ": loss_fn.logZ.item() if hasattr(loss_fn, 'logZ') else None,
                 "elapsed_seconds": elapsed,
+                "batch_sample_dist": batch_sample_dist,
             }
             with open(log_path, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
@@ -376,24 +565,29 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
             torch.save(checkpoint, os.path.join(save_dir, ckpt_name))
             print(f"  -> Saved checkpoint: {ckpt_name}", flush=True)
         
-        # Early stopping check
-        if best_colors < prev_best_colors:
-            prev_best_colors = best_colors
+        # Early stopping check based on distribution mean improvement
+        chromatic = getattr(env, 'chromatic_number', None)
+        
+        # Compute current mean colors from batch distribution
+        current_mean_colors = float('inf')
+        if batch_sample_dist:
+            colors_list = []
+            for c, count in batch_sample_dist.items():
+                colors_list.extend([c] * count)
+            if colors_list:
+                current_mean_colors = np.mean(colors_list)
+        
+        # Check if distribution is improving (mean colors decreasing)
+        if current_mean_colors < prev_mean_colors - 0.01:  # Small threshold to avoid noise
+            prev_mean_colors = current_mean_colors
             steps_without_improvement = 0
         else:
             steps_without_improvement += 1
         
-        # Stop if optimal coloring found
-        chromatic = getattr(env, 'chromatic_number', None)
-        if chromatic and best_colors <= chromatic:
-            print(f"\n✓ Optimal coloring found! Colors used: {best_colors} (chromatic number: {chromatic})")
-            print(f"  Stopping at step {step + 1}")
-            break
-        
-        # Stop if no improvement for patience steps
-        if early_stop_patience and steps_without_improvement >= early_stop_patience:
-            print(f"\n⚠ Early stopping: no improvement for {early_stop_patience} steps")
-            print(f"  Best colors: {best_colors}, Chromatic number: {chromatic}")
+        # Stop if no improvement for patience steps (disabled if patience <= 0)
+        if early_stop_patience > 0 and steps_without_improvement >= early_stop_patience:
+            print(f"\n⚠ Early stopping: distribution not improving for {early_stop_patience} steps")
+            print(f"  Mean colors: {current_mean_colors:.2f}, Best: {best_colors}, Chromatic: {chromatic}")
             break
 
     return best_state if best_state is not None else last_terminal_state, best_colors
@@ -585,7 +779,8 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                       steps=2000, device="cpu", save_dir="checkpoints", problem_name=None,
                       batch_size=16, epsilon_start=0.3, log_dir="logs", save_every=500,
                       early_stop_patience=500, top_p=1.0, temperature=1.0,
-                      same_instance_per_batch=True, resume_from=None):
+                      same_instance_per_batch=True, resume_from=None,
+                      prev_stage_distributions=None, current_stage_instance=None):
     """
     Train Conditional GFlowNet for graph coloring on multiple graph instances.
     
@@ -610,6 +805,10 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
         temperature: Sampling temperature
         same_instance_per_batch: If True, all trajectories in a batch use same instance
         resume_from: Path to checkpoint to resume from (or 'latest' to find latest)
+        prev_stage_distributions: Dict mapping instance names to their best distributions 
+                                  from previous stages (for plotting comparison)
+        current_stage_instance: Name of the current stage's instance (for best checkpoint criterion).
+                               If None, uses all instances for the criterion.
     """
     reward_history = []
     loss_history = []
@@ -626,9 +825,19 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             'name': inst['name']
         }
     
-    # Early stopping
+    # Early stopping based on distribution mean improvement
     steps_without_improvement = 0
-    prev_best_avg = float('inf')
+    prev_mean_colors_avg = float('inf')
+    
+    # Track distribution history per instance for plotting
+    distribution_history = {}  # instance_idx -> list of (step, mean, std)
+    for i in range(env.num_instances):
+        distribution_history[i] = []
+    
+    # Track best distribution per instance for plotting
+    best_dist_per_instance = {}  # instance_idx -> {'dist': {colors: count}, 'step': step, 'mean': mean}
+    for i in range(env.num_instances):
+        best_dist_per_instance[i] = {'dist': None, 'step': None, 'mean': float('inf')}
     
     # Create directories
     os.makedirs(save_dir, exist_ok=True)
@@ -689,6 +898,14 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
         log_name = f"{problem_name}_{timestamp}" if problem_name else f"train_conditional_{timestamp}"
     log_path = os.path.join(log_dir, f"{log_name}.jsonl")
     
+    # Setup distribution plot paths in separate folder (one per instance)
+    dist_dir = os.path.join(os.path.dirname(log_dir), "distribution")
+    os.makedirs(dist_dir, exist_ok=True)
+    plot_paths = {}
+    for i in range(env.num_instances):
+        inst_name = best_per_instance[i]['name']
+        plot_paths[i] = os.path.join(dist_dir, f"{log_name}_{inst_name}_distribution.png")
+    
     # Detect loss type
     loss_type = "TB"
     if hasattr(loss_fn, 'lambda_'):
@@ -718,20 +935,100 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
     with open(log_path, "w") as f:
         f.write(json.dumps(config) + "\n")
     
+    # steps parameter is the number of steps to train FOR THIS STAGE
+    # When resuming, we train from start_step to start_step + steps
+    end_step = start_step + steps
+    
     print(f"Conditional GFlowNet Training")
     print(f"  Instances: {env.num_instances}")
     print(f"  Colors: {env.K}")
     print(f"  Loss: {loss_type}")
     if start_step > 0:
         print(f"  Resuming from step: {start_step}")
-    print(f"  Total steps: {steps}")
+    print(f"  Steps this stage: {steps}")
+    print(f"  End step: {end_step}")
     print(f"  Logging to: {log_path}")
     print()
     
     start_time = time.time()
     
-    for step in range(start_step, steps):
-        epsilon = max(0.01, epsilon_start * (1 - step / steps))
+    # Store initial distributions for plotting comparison
+    init_sample_dist = {}  # instance_idx -> {colors: count}
+    init_step_per_instance = {}  # instance_idx -> step number for initial distribution
+    
+    # For instances with previous stage distributions, use those as initial
+    if prev_stage_distributions:
+        for inst_idx in range(env.num_instances):
+            inst_name = best_per_instance[inst_idx]['name']
+            if inst_name in prev_stage_distributions:
+                prev_info = prev_stage_distributions[inst_name]
+                init_sample_dist[inst_idx] = prev_info['distribution']
+                init_step_per_instance[inst_idx] = prev_info.get('step', 0)
+    
+    # Sample initial distribution at the start of this stage (for baseline comparison)
+    # Sample for EACH instance that doesn't have a previous stage distribution
+    with torch.no_grad():
+        for inst_idx in range(env.num_instances):
+            # Skip instances that already have previous stage distribution
+            if inst_idx in init_sample_dist:
+                continue
+            
+            # Sample a batch specifically for this instance
+            init_trajectories = sample_trajectories_conditional_batched(
+                env, forward_policy, device, batch_size,
+                epsilon=epsilon_start, temperature=temperature, top_p=top_p,
+                same_instance=True, instance_idx=inst_idx
+            )
+            
+            init_sample_dist[inst_idx] = {}
+            init_step_per_instance[inst_idx] = start_step
+            
+            for states_list, actions_list, reward, instance_idx, adj in init_trajectories:
+                final_state = states_list[-1]
+                N = len(final_state)
+                colored = np.sum(final_state != -1)
+                if colored == N:
+                    colors_used = len(set(c for c in final_state if c != -1))
+                    conflicts = 0
+                    for u in range(N):
+                        for v in range(u + 1, N):
+                            if adj[u, v] == 1 and final_state[u] == final_state[v]:
+                                conflicts += 1
+                    if conflicts == 0:
+                        init_sample_dist[inst_idx][colors_used] = init_sample_dist[inst_idx].get(colors_used, 0) + 1
+        
+        # Record initial distribution in history and plot for each instance
+        init_label = f"[{start_step}] Initial distribution:"
+        print(init_label)
+        for inst_idx, dist in sorted(init_sample_dist.items()):
+            if dist:
+                colors_list = []
+                for c, count in dist.items():
+                    colors_list.extend([c] * count)
+                if colors_list:
+                    mean_colors = np.mean(colors_list)
+                    std_colors = np.std(colors_list)
+                    inst_init_step = init_step_per_instance.get(inst_idx, start_step)
+                    distribution_history[inst_idx].append((inst_init_step, mean_colors, std_colors))
+                    inst_name = best_per_instance[inst_idx]['name']
+                    chromatic = env.get_instance(inst_idx).get('chromatic_number', None)
+                    chromatic_str = chromatic if chromatic else '?'
+                    # Mark if this is from previous stage
+                    prev_marker = " [prev stage]" if inst_idx in init_step_per_instance and init_step_per_instance[inst_idx] != start_step else ""
+                    print(f"    {inst_name} (χ={chromatic_str}): {mean_colors:.2f}±{std_colors:.2f} colors, range=[{min(dist.keys())},{max(dist.keys())}], valid={sum(dist.values())}/{batch_size}{prev_marker}")
+                    plot_sample_distribution(
+                        dist, inst_init_step, chromatic, f"{problem_name or 'Training'} - {inst_name}",
+                        plot_paths[inst_idx], history=distribution_history[inst_idx],
+                        instance_name=inst_name
+                    )
+    
+    # Initialize step in case loop doesn't run
+    step = start_step
+    
+    for step in range(start_step, end_step):
+        # Epsilon decays based on progress within this stage
+        stage_progress = (step - start_step) / steps
+        epsilon = max(0.01, epsilon_start * (1 - stage_progress))
         
         # Sample trajectories
         if same_instance_per_batch:
@@ -747,6 +1044,9 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             )
         
         batch_rewards = []
+        
+        # Track sample distribution per instance for this batch
+        batch_sample_dist = {}  # instance_idx -> {colors: count}
         
         # Track best colorings
         for states_list, actions_list, reward, instance_idx, adj in batch_trajectories:
@@ -768,6 +1068,12 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                     for v in range(u + 1, N):
                         if adj[u, v] == 1 and final_state[u] == final_state[v]:
                             conflicts += 1
+                
+                # Track sample distribution (only valid colorings)
+                if conflicts == 0:
+                    if instance_idx not in batch_sample_dist:
+                        batch_sample_dist[instance_idx] = {}
+                    batch_sample_dist[instance_idx][colors_used] = batch_sample_dist[instance_idx].get(colors_used, 0) + 1
                 
                 if conflicts == 0 and colors_used < best_per_instance[instance_idx]['colors']:
                     best_per_instance[instance_idx]['colors'] = colors_used
@@ -839,13 +1145,25 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             avg_reward = np.mean(reward_history[-50*batch_size:]) if len(reward_history) >= 50*batch_size else np.mean(reward_history)
             elapsed = time.time() - start_time
             
-            # Calculate average best colors across instances
-            avg_best_colors = np.mean([v['colors'] for v in best_per_instance.values()])
+            # Calculate average mean colors from current batch distribution
+            avg_colors = float('inf')
+            if batch_sample_dist:
+                mean_colors_list = []
+                for inst_idx, dist in batch_sample_dist.items():
+                    if dist:
+                        colors_list = []
+                        for c, count in dist.items():
+                            colors_list.extend([c] * count)
+                        if colors_list:
+                            mean_colors_list.append(np.mean(colors_list))
+                if mean_colors_list:
+                    avg_colors = np.mean(mean_colors_list)
             
-            # ETA
-            if step > 0:
-                steps_remaining = steps - step
-                time_per_step = elapsed / step
+            # ETA based on steps remaining in this stage
+            if step > start_step:
+                steps_remaining = end_step - step
+                steps_done = step - start_step
+                time_per_step = elapsed / steps_done
                 eta_seconds = steps_remaining * time_per_step
                 eta_min, eta_sec = divmod(int(eta_seconds), 60)
                 eta_hour, eta_min = divmod(eta_min, 60)
@@ -854,8 +1172,48 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 eta_str = "--"
             
             print(f"[{step}] loss={cumulative_loss.item():.4f}, log_reward={avg_reward:.2f}, "
-                  f"avg_best_colors={avg_best_colors:.2f}, no_improv={steps_without_improvement}, "
+                  f"avg_colors={avg_colors:.2f}, no_improv={steps_without_improvement}, "
                   f"eps={epsilon:.3f}, ETA={eta_str}", flush=True)
+            
+            # Print sample distribution for this batch (mean ± std) and update plots
+            if batch_sample_dist:
+                for inst_idx, dist in sorted(batch_sample_dist.items()):
+                    inst_name = best_per_instance[inst_idx]['name']
+                    chromatic = env.get_instance(inst_idx).get('chromatic_number', None)
+                    total_valid = sum(dist.values())
+                    # Compute mean and std of colors
+                    colors_list = []
+                    for c, count in dist.items():
+                        colors_list.extend([c] * count)
+                    if colors_list:
+                        mean_colors = np.mean(colors_list)
+                        std_colors = np.std(colors_list)
+                        min_colors = min(dist.keys())
+                        max_colors = max(dist.keys())
+                        chromatic_str = chromatic if chromatic else '?'
+                        print(f"    {inst_name} (χ={chromatic_str}): {mean_colors:.2f}±{std_colors:.2f} colors, range=[{min_colors},{max_colors}], valid={total_valid}/{batch_size}", flush=True)
+                        
+                        # Track history and update plot for this instance
+                        distribution_history[inst_idx].append((step, mean_colors, std_colors))
+                        
+                        # Update best distribution for this instance if improved
+                        if mean_colors < best_dist_per_instance[inst_idx]['mean']:
+                            best_dist_per_instance[inst_idx] = {
+                                'dist': dict(dist),  # Copy the distribution
+                                'step': step,
+                                'mean': mean_colors
+                            }
+                        
+                        # Get initial distribution for this instance (if available)
+                        inst_init_dist = init_sample_dist.get(inst_idx, None)
+                        inst_init_step = init_step_per_instance.get(inst_idx, start_step)
+                        plot_sample_distribution(
+                            dist, step, chromatic, f"{problem_name or 'Training'} - {inst_name}",
+                            plot_paths[inst_idx], history=distribution_history[inst_idx],
+                            instance_name=inst_name, init_dist=inst_init_dist, init_step=inst_init_step,
+                            best_dist=best_dist_per_instance[inst_idx]['dist'],
+                            best_step=best_dist_per_instance[inst_idx]['step']
+                        )
             
             # Log to file
             log_entry = {
@@ -864,12 +1222,13 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 "loss": cumulative_loss.item(),
                 "avg_loss": avg_loss,
                 "avg_reward": avg_reward,
-                "avg_best_colors": avg_best_colors,
+                "avg_colors": avg_colors,
                 "steps_without_improvement": steps_without_improvement,
                 "epsilon": epsilon,
                 "logZ": loss_fn.logZ.item() if hasattr(loss_fn, 'logZ') else None,
                 "elapsed_seconds": elapsed,
                 "best_per_instance": {str(k): v['colors'] for k, v in best_per_instance.items()},
+                "batch_sample_dist": {str(k): v for k, v in batch_sample_dist.items()},
             }
             with open(log_path, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
@@ -894,13 +1253,39 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
             torch.save(checkpoint, os.path.join(save_dir, ckpt_name))
             print(f"  -> Saved checkpoint: {ckpt_name}", flush=True)
         
-        # Early stopping check
-        avg_best_colors = np.mean([v['colors'] for v in best_per_instance.values()])
-        if avg_best_colors < prev_best_avg:
-            prev_best_avg = avg_best_colors
+        # Early stopping check based on distribution mean improvement
+        # Only consider current stage instance if specified, otherwise all instances
+        current_mean_colors_list = []
+        for inst_idx, dist in batch_sample_dist.items():
+            # If current_stage_instance is set, only use that instance for the criterion
+            if current_stage_instance is not None:
+                inst_name = best_per_instance[inst_idx]['name']
+                if inst_name != current_stage_instance:
+                    continue
+            if dist:
+                colors_list = []
+                for c, count in dist.items():
+                    colors_list.extend([c] * count)
+                if colors_list:
+                    current_mean_colors_list.append(np.mean(colors_list))
+        
+        current_mean_colors_avg = np.mean(current_mean_colors_list) if current_mean_colors_list else float('inf')
+        
+        # Use small epsilon to avoid floating point issues, save when truly better
+        if current_mean_colors_avg < prev_mean_colors_avg - 1e-6:
+            prev_mean_colors_avg = current_mean_colors_avg
             steps_without_improvement = 0
             
-            # Save best checkpoint
+            # Save best checkpoint when distribution improves
+            avg_best_colors = np.mean([v['colors'] for v in best_per_instance.values()])
+            # Save distributions per instance for use in subsequent stages
+            best_distributions = {}
+            for inst_idx, dist in batch_sample_dist.items():
+                inst_name = best_per_instance[inst_idx]['name']
+                best_distributions[inst_name] = {
+                    'distribution': dist,
+                    'step': step + 1
+                }
             best_checkpoint = {
                 'step': step + 1,
                 'forward_policy': forward_policy.state_dict(),
@@ -909,20 +1294,27 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
                 'optimizer': optimizer.state_dict(),
                 'best_reward': best_reward,
                 'best_per_instance': best_per_instance,
+                'best_distributions': best_distributions,
                 'problem_name': problem_name,
                 'num_colors': env.K,
                 'avg_best_colors': avg_best_colors,
+                'mean_colors_avg': current_mean_colors_avg,
             }
             if problem_name:
                 best_ckpt_name = f'{problem_name}_best.pt'
             else:
                 best_ckpt_name = 'conditional_best.pt'
             torch.save(best_checkpoint, os.path.join(save_dir, best_ckpt_name))
+            criterion_info = f" [{current_stage_instance}]" if current_stage_instance else ""
+            print(f"  -> Saved best checkpoint: {best_ckpt_name} (avg_colors={current_mean_colors_avg:.2f}{criterion_info})", flush=True)
         else:
             steps_without_improvement += 1
         
-        if early_stop_patience and steps_without_improvement >= early_stop_patience:
-            print(f"\n⚠ Early stopping: no improvement for {early_stop_patience} steps")
+        # Stop if no improvement for patience steps (disabled if patience <= 0)
+        if early_stop_patience > 0 and steps_without_improvement >= early_stop_patience:
+            avg_best_colors = np.mean([v['colors'] for v in best_per_instance.values()])
+            print(f"\n⚠ Early stopping: distribution not improving for {early_stop_patience} steps")
+            print(f"  Mean colors: {current_mean_colors_avg:.2f}, Best avg: {avg_best_colors:.2f}")
             break
     
     # Save final checkpoint
@@ -953,4 +1345,19 @@ def train_conditional(env, forward_policy, backward_policy, loss_fn, optimizer,
         chromatic = inst.get('chromatic_number', '?')
         print(f"  {info['name']}: {info['colors']} colors (chromatic: {chromatic})")
     
-    return best_per_instance
+    # Build initial distribution info for logging
+    init_dist_info = {}
+    for inst_idx, dist in init_sample_dist.items():
+        inst_name = best_per_instance[inst_idx]['name']
+        if dist:
+            colors_list = []
+            for c, count in dist.items():
+                colors_list.extend([c] * count)
+            init_dist_info[inst_name] = {
+                'distribution': {str(k): v for k, v in dist.items()},  # JSON keys must be strings
+                'mean': float(np.mean(colors_list)) if colors_list else None,
+                'std': float(np.std(colors_list)) if colors_list else None,
+                'step': init_step_per_instance.get(inst_idx, start_step),
+            }
+    
+    return best_per_instance, init_dist_info

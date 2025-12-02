@@ -52,6 +52,8 @@ def main():
                         help="Hidden dimension for policy networks")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="Save checkpoint every N steps")
+    parser.add_argument("--reward-alpha", type=float, default=1.0,
+                        help="Reward scaling coefficient (higher = sharper reward distribution)")
     
     # Random instance generation
     parser.add_argument("--random", action="store_true",
@@ -183,7 +185,7 @@ def main():
     print()
     
     # Create environment
-    env = TSPEnv(instance)
+    env = TSPEnv(instance, alpha=args.reward_alpha)
     
     # Create policies
     forward = TSPPolicy(num_cities=N, hidden_dim=args.hidden_dim).to(device)
@@ -246,8 +248,11 @@ def main():
     
     if optimal_length:
         gap = (best_length - optimal_length) / optimal_length * 100
-        print(f"\n  Optimal length: {optimal_length:.2f}")
-        print(f"  Gap to optimal: {gap:.2f}%")
+        print(f"\n  Baseline length: {optimal_length:.2f}")
+        if gap < -0.0001:
+            print(f"  Gap to baseline: {gap:.2f}% (Better than baseline!)")
+        else:
+            print(f"  Gap to baseline: {gap:.2f}%")
 
 
 def main_conditional(args):
@@ -285,7 +290,7 @@ def main_conditional(args):
     print()
     
     # Create conditional environment
-    env = ConditionalTSPEnv(dataset)
+    env = ConditionalTSPEnv(dataset, alpha=args.reward_alpha)
     
     # Create conditional policy with shared backbone
     shared_policy = ConditionalTSPPolicy(
@@ -368,6 +373,8 @@ def main_wrapper():
                         help="Hidden dimension for policy networks")
     parser.add_argument("--save-every", type=int, default=1000,
                         help="Save checkpoint every N steps")
+    parser.add_argument("--reward-alpha", type=float, default=1.0,
+                        help="Reward scaling coefficient")
     
     # Random instance
     parser.add_argument("--random", action="store_true",

@@ -215,6 +215,17 @@ class ConditionalGraphColoringEnv:
         self._adj_np = self._current_instance['adj']
         self.adj = self._adj_np
         self.chromatic_number = self._current_instance['chromatic_number']
+        
+        # Reward parameters
+        self.alpha = 1.0  # Conflict penalty
+        self.beta = 0.5   # Color usage penalty
+        self.gamma = 0.2  # Uncolored penalty
+        
+    def set_reward_params(self, alpha=None, beta=None, gamma=None):
+        """Set reward function parameters."""
+        if alpha is not None: self.alpha = alpha
+        if beta is not None: self.beta = beta
+        if gamma is not None: self.gamma = gamma
     
     def set_instance(self, idx):
         """Set the current instance by index."""
@@ -284,11 +295,7 @@ class ConditionalGraphColoringEnv:
         colors_used = len(set(c for c in state if c != -1)) if colored > 0 else 0
         missing = self.N - colored
         
-        alpha = 1.0
-        beta = 0.5
-        gamma = 0.2
-        
-        logR = -alpha * conflicts - beta * colors_used - gamma * missing
+        logR = -self.alpha * conflicts - self.beta * colors_used - self.gamma * missing
         logR = logR * self.N
         
         return float(logR)
@@ -333,11 +340,7 @@ class ConditionalGraphColoringEnv:
         colored_counts = colored_mask.sum(axis=1)
         missing = N - colored_counts
         
-        alpha = 1.0
-        beta = 0.5
-        gamma = 0.2
-        
-        logR = -alpha * conflicts - beta * colors_used - gamma * missing
+        logR = -self.alpha * conflicts - self.beta * colors_used - self.gamma * missing
         logR = logR * N
         
         return logR

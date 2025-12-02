@@ -98,10 +98,19 @@ def sample_greedy(env, policy, adj, device):
 
 
 def sample_stochastic(env, policy, adj, device, num_samples=100):
-    """Sample multiple solutions stochastically and return the best."""
+    """
+    Sample multiple solutions stochastically and return the best.
+    
+    Returns:
+        best_state: Best coloring found
+        sample_distribution: Dict mapping colors -> count (for valid solutions)
+    """
     best_state = None
     best_colors = float('inf')
     best_conflicts = float('inf')
+    
+    # Track sample distribution
+    sample_distribution = {}  # colors -> count
     
     with torch.no_grad():
         for _ in range(num_samples):
@@ -126,13 +135,17 @@ def sample_stochastic(env, policy, adj, device, num_samples=100):
             conflicts = count_conflicts(adj, state)
             colors_used = len(set(c for c in state if c != -1))
             
+            # Track sample distribution (only valid colorings)
+            if conflicts == 0 and np.sum(state != -1) == env.N:
+                sample_distribution[colors_used] = sample_distribution.get(colors_used, 0) + 1
+            
             # Prefer: no conflicts, then fewer colors
             if conflicts < best_conflicts or (conflicts == best_conflicts and colors_used < best_colors):
                 best_conflicts = conflicts
                 best_colors = colors_used
                 best_state = state.copy()
     
-    return best_state
+    return best_state, sample_distribution
 
 
 def evaluate_graph(filename, checkpoint_path, device, num_samples=100):
@@ -164,7 +177,7 @@ def evaluate_graph(filename, checkpoint_path, device, num_samples=100):
     greedy_colored = np.sum(greedy_state != -1)
     
     # Stochastic evaluation (best of N samples)
-    stoch_state = sample_stochastic(env, forward, adj, device, num_samples)
+    stoch_state, sample_dist = sample_stochastic(env, forward, adj, device, num_samples)
     stoch_conflicts = count_conflicts(adj, stoch_state)
     stoch_colors = len(set(c for c in stoch_state if c != -1))
     stoch_colored = np.sum(stoch_state != -1)
@@ -183,6 +196,7 @@ def evaluate_graph(filename, checkpoint_path, device, num_samples=100):
         'stochastic_conflicts': stoch_conflicts,
         'stochastic_colored': stoch_colored,
         'stochastic_state': stoch_state,
+        'sample_distribution': sample_dist,
         'training_step': checkpoint.get('step', '?'),
     }
     
@@ -339,14 +353,24 @@ def main():
             else:
                 print(f"  ✓ Valid coloring (+{results['stochastic_colors'] - chromatic} extra colors)")
         
-        # Show color distribution
-        print(f"\nColor distribution (stochastic):")
-        color_counts = {}
-        for c in results['stochastic_state']:
-            if c != -1:
-                color_counts[c] = color_counts.get(c, 0) + 1
-        for c in sorted(color_counts.keys()):
-            print(f"  Color {c}: {color_counts[c]} nodes")
+        # Show sample distribution (mean ± std)
+        sample_dist = results.get('sample_distribution', {})
+        if sample_dist:
+            colors_list = []
+            for c, count in sample_dist.items():
+                colors_list.extend([c] * count)
+            if colors_list:
+                mean_colors = np.mean(colors_list)
+                std_colors = np.std(colors_list)
+                min_colors = min(sample_dist.keys())
+                max_colors = max(sample_dist.keys())
+                total_valid = sum(sample_dist.values())
+                print(f"\nSample Distribution (n={total_valid} valid samples):")
+                print(f"  Mean: {mean_colors:.2f} ± {std_colors:.2f} colors")
+                print(f"  Range: [{min_colors}, {max_colors}]")
+                print(f"  Chromatic: {chromatic}")
+                breakdown = ", ".join(f"{c}:{n}" for c, n in sorted(sample_dist.items()))
+                print(f"  Breakdown: {breakdown}")
             
     except Exception as e:
         print(f"Error: {e}")
@@ -385,6 +409,7 @@ def main():
             "is_valid": results['stochastic_conflicts'] == 0 and results['stochastic_colored'] == results['nodes'],
             "is_optimal": results['stochastic_conflicts'] == 0 and results['stochastic_colors'] <= chromatic,
             "state": results['stochastic_state'].tolist(),
+            "sample_distribution": {str(k): v for k, v in results.get('sample_distribution', {}).items()},
         },
     }
     
@@ -504,11 +529,20 @@ def sample_greedy_conditional(adj, num_colors, policy, device):
 
 
 def sample_stochastic_conditional(adj, num_colors, policy, device, num_samples=100):
-    """Sample multiple solutions stochastically for conditional GFlowNet."""
+    """
+    Sample multiple solutions stochastically for conditional GFlowNet.
+    
+    Returns:
+        best_state: Best coloring found
+        sample_distribution: Dict mapping (colors, conflicts) -> count
+    """
     N = adj.shape[0]
     best_state = None
     best_colors = float('inf')
     best_conflicts = float('inf')
+    
+    # Track distribution of samples
+    sample_distribution = {}  # (colors, conflicts) -> count
     
     # Create temporary env
     instance = {'adj': adj}
@@ -537,12 +571,16 @@ def sample_stochastic_conditional(adj, num_colors, policy, device, num_samples=1
             conflicts = count_conflicts(adj, state)
             colors_used = len(set(c for c in state if c != -1))
             
+            # Track sample distribution
+            key = (colors_used, conflicts)
+            sample_distribution[key] = sample_distribution.get(key, 0) + 1
+            
             if conflicts < best_conflicts or (conflicts == best_conflicts and colors_used < best_colors):
                 best_conflicts = conflicts
                 best_colors = colors_used
                 best_state = state.copy()
     
-    return best_state
+    return best_state, sample_distribution
 
 
 def evaluate_conditional(checkpoint_path, graphs, device, num_samples=100):
@@ -597,7 +635,7 @@ def evaluate_conditional(checkpoint_path, graphs, device, num_samples=100):
         greedy_colored = np.sum(greedy_state != -1)
         
         # Stochastic evaluation
-        stoch_state = sample_stochastic_conditional(adj, num_colors, forward, device, num_samples)
+        stoch_state, sample_dist = sample_stochastic_conditional(adj, num_colors, forward, device, num_samples)
         stoch_conflicts = count_conflicts(adj, stoch_state)
         stoch_colors = len(set(c for c in stoch_state if c != -1))
         stoch_colored = np.sum(stoch_state != -1)
@@ -640,9 +678,10 @@ def evaluate_conditional(checkpoint_path, graphs, device, num_samples=100):
             stoch_info += f", {stoch_colored}/{N} colored"
         print(f"  Stochastic: {stoch_info} {stoch_status}")
         
-        # Store states for output
+        # Store states and sample distribution for output
         results[graph_file]['greedy']['state'] = greedy_state.tolist()
         results[graph_file]['stochastic']['state'] = stoch_state.tolist()
+        results[graph_file]['stochastic']['sample_distribution'] = sample_dist
     
     return results
 
@@ -725,12 +764,35 @@ def main_conditional_eval(args):
         print(f"  Colors used: {colors_used}, Conflicts: {conflicts}")
         print(f"  Coloring: {state}")
         
-        # Show color distribution
-        color_counts = {}
-        for c in state:
-            if c != -1:
-                color_counts[c] = color_counts.get(c, 0) + 1
-        print(f"  Distribution: {dict(sorted(color_counts.items()))}")
+        # Show sample distribution statistics (mean ± std)
+        sample_dist = r['stochastic'].get('sample_distribution', {})
+        if sample_dist:
+            # Compute mean and std of colors from valid samples
+            colors_list = []
+            for (num_colors, num_conflicts), count in sample_dist.items():
+                if num_conflicts == 0:  # Only valid colorings
+                    colors_list.extend([num_colors] * count)
+            
+            if colors_list:
+                mean_colors = np.mean(colors_list)
+                std_colors = np.std(colors_list)
+                min_colors = min(c for (c, conf), _ in sample_dist.items() if conf == 0)
+                max_colors = max(c for (c, conf), _ in sample_dist.items() if conf == 0)
+                chromatic = r.get('chromatic', '?')
+                print(f"\n  Sample Distribution (n={len(colors_list)} valid samples):")
+                print(f"    Mean: {mean_colors:.2f} ± {std_colors:.2f} colors")
+                print(f"    Range: [{min_colors}, {max_colors}]")
+                print(f"    Chromatic: {chromatic}")
+                
+                # Show histogram-style breakdown
+                color_counts = {}
+                for (c, conf), count in sample_dist.items():
+                    if conf == 0:
+                        color_counts[c] = color_counts.get(c, 0) + count
+                
+                print(f"    Breakdown: ", end="")
+                breakdown = ", ".join(f"{c}:{n}" for c, n in sorted(color_counts.items()))
+                print(breakdown)
     
     # Save results
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -738,12 +800,25 @@ def main_conditional_eval(args):
     log_name = f"eval_conditional_{timestamp}.json"
     log_path = os.path.join(LOG_DIR, log_name)
     
+    # Convert tuple keys to strings for JSON serialization
+    results_json = {}
+    for graph_file, r in results.items():
+        r_copy = dict(r)
+        if 'sample_distribution' in r_copy.get('stochastic', {}):
+            # Convert (colors, conflicts) tuple keys to "colors,conflicts" strings
+            dist = r_copy['stochastic']['sample_distribution']
+            r_copy['stochastic'] = dict(r_copy['stochastic'])
+            r_copy['stochastic']['sample_distribution'] = {
+                f"{k[0]},{k[1]}": v for k, v in dist.items()
+            }
+        results_json[graph_file] = r_copy
+    
     log_data = {
         "type": "conditional_evaluation",
         "timestamp": timestamp,
         "checkpoint": os.path.basename(checkpoint_path),
         "num_samples": args.samples,
-        "results": results,
+        "results": results_json,
         "summary": {
             "total_graphs": len(results),
             "valid_colorings": total_valid,

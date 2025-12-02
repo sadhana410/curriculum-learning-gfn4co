@@ -297,11 +297,18 @@ def train(env, forward_policy, backward_policy, loss_fn, optimizer,
         else:
             steps_without_improvement += 1
         
+        # Check if we found a solution better than the provided "optimal" (which might be a heuristic)
+        if optimal_length and best_length < optimal_length:
+            gap = (best_length - optimal_length) / optimal_length * 100
+            print(f"\n!!! Found solution better than provided baseline (gap {gap:.4f}%) !!!")
+            print(f"Updating baseline from {optimal_length:.4f} to {best_length:.4f}")
+            optimal_length = best_length
+        
         # Check if optimal solution found (within 0.01% tolerance)
         if optimal_length and best_length <= optimal_length * 1.0001:
             gap = max(0, (best_length - optimal_length) / optimal_length * 100)
-            print(f"\n✓ Optimal solution found at step {step}!")
-            print(f"  Best length: {best_length:.4f}, Optimal: {optimal_length:.4f}, Gap: {gap:.4f}%")
+            print(f"\n✓ Optimal/Baseline solution found at step {step}!")
+            print(f"  Best length: {best_length:.4f}, Baseline: {optimal_length:.4f}, Gap: {gap:.4f}%")
             # Save final checkpoint
             checkpoint = {
                 'step': step + 1,

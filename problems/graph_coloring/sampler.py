@@ -372,7 +372,7 @@ def sample_trajectories_conditional(env, forward_policy, device, batch_size,
 
 def sample_trajectories_conditional_batched(env, forward_policy, device, batch_size,
                                             epsilon=0.1, temperature=1.0, top_p=1.0,
-                                            same_instance=False):
+                                            same_instance=False, instance_idx=None):
     """
     Sample trajectories with batched forward passes when possible.
     
@@ -388,13 +388,17 @@ def sample_trajectories_conditional_batched(env, forward_policy, device, batch_s
         temperature: sampling temperature
         top_p: nucleus sampling threshold
         same_instance: if True, use same instance for all trajectories in batch
+        instance_idx: if provided, use this specific instance (requires same_instance=True)
         
     Returns:
         List of (states_list, actions_list, reward, instance_idx, adj)
     """
     if same_instance:
         # All trajectories use the same instance - can batch efficiently
-        instance_idx = env.sample_instance()
+        if instance_idx is None:
+            instance_idx = env.sample_instance()
+        else:
+            env.set_instance(instance_idx)
         adj = env._adj_np
         N, K = env.N, env.K
         
